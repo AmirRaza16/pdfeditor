@@ -12,6 +12,19 @@ interface PageEntry { id: string; src: number | null; }
 const FONTS = ALL_FONTS;
 const DEFAULT_SIZE = { w: 595.28, h: 841.89 }; // A4 in points
 const PDFJS_WORKER = 'https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
+
+// --- Fabric.js v6 text metrics (mirrored from the library source) ---
+// Fabric renders the first line's alphabetic baseline at
+//   fontSize * _fontSizeMult * (1 - _fontSizeFraction)  below the textbox top,
+// and advances each following line by  fontSize * lineHeight * _fontSizeMult.
+// Replicating these exactly keeps imported overlays on the original baseline AND
+// makes the exported PDF match the on-screen editor on every device.
+const FABRIC_FONT_SIZE_MULT = 1.13;       // Text.prototype._fontSizeMult
+const FABRIC_FONT_SIZE_FRACTION = 0.222;  // Text.prototype._fontSizeFraction
+const FABRIC_LINE_HEIGHT = 1.16;          // default Textbox lineHeight
+const FABRIC_BASELINE_RATIO = FABRIC_FONT_SIZE_MULT * (1 - FABRIC_FONT_SIZE_FRACTION); // ≈ 0.8791
+const FABRIC_LINE_ADVANCE = FABRIC_LINE_HEIGHT * FABRIC_FONT_SIZE_MULT;                 // ≈ 1.3108
+const TEXT_IMPORT_SIZE_RATIO = 0.92;      // overlay font size vs raw glyph-box height
 // Custom fabric properties that must survive toObject/loadFromJSON round-trips.
 const EXTRA_PROPS = ['_isOriginal', '_origText', '_origColor', '_maskColor', '_maskW', '_maskH', '_origLeft', '_origTop', '_fontKey', '_fallbackFamily', '_origFamily', '_origWeight', '_origItalic', '_whiteout', '_edited'];
 
@@ -500,7 +513,13 @@ export default function PDFEditor() {
         const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
         const fontHeight = Math.hypot(tx[2], tx[3]);
         if (fontHeight < 2) return;
-        const top = tx[5] - fontHeight;
+        // tx[4]/tx[5] is the original glyph baseline origin. glyphTop = raw
+        // glyph-box top, kept for colour sampling + export mask coverage.
+        const glyphTop = tx[5] - fontHeight;
+        // Place the box so Fabric's first-line baseline lands exactly on the
+        // original baseline (tx[5]); see FABRIC_BASELINE_RATIO.
+        const overlayFontSize = fontHeight * TEXT_IMPORT_SIZE_RATIO;
+        const top = tx[5] - overlayFontSize * FABRIC_BASELINE_RATIO;
 
         // Derive font weight / style / family from the PDF's font info so we
         // don't flatten bold/italic text on import.
@@ -530,12 +549,12 @@ export default function PDFEditor() {
         const displayFamily = family;
 
         const boxW = Math.max(20, (item.width || item.str.length * fontHeight * 0.5) + 4);
-        const { bg, fg } = sampleRegion(tx[4], top, item.width || boxW, fontHeight * 1.2);
+        const { bg, fg } = sampleRegion(tx[4], glyphTop, item.width || boxW, fontHeight * 1.2);
 
         // Imported text is invisible by default (fill + background transparent),
         // so the page keeps its exact original appearance until edited.
         const tb = new fabric.Textbox(item.str, {
-          left: tx[4], top, fontSize: fontHeight * 0.92,
+          left: tx[4], top, fontSize: overlayFontSize,
           fill: 'transparent', fontFamily: displayFamily,
           fontWeight: isBold ? 700 : 400,
           fontStyle: isItalic ? 'italic' : 'normal',
@@ -551,7 +570,7 @@ export default function PDFEditor() {
           _maskW: item.width || boxW,
           _maskH: fontHeight * 1.3,
           _origLeft: tx[4],
-          _origTop: top,
+          _origTop: glyphTop,
           _fontKey: fontKey,
           _origFamily: displayFamily,
           _origWeight: isBold ? 700 : 400,
@@ -957,9 +976,8 @@ export default function PDFEditor() {
           // line by lineHeight * _fontSizeMult (defaults: lineHeight 1.16,
           // _fontSizeMult 1.13). The previous 0.8 / 1.16 approximation drew text
           // ~0.33*fontSize too high and packed multi-line text too tightly.
-          const FONT_SIZE_MULT = 1.13;
-          const lineHeight = size * 1.16 * FONT_SIZE_MULT;
-          const firstBaseline = size * FONT_SIZE_MULT;
+          const lineHeight = size * FABRIC_LINE_ADVANCE;
+          const firstBaseline = size * FABRIC_BASELINE_RATIO;
 
           // Cover what was underneath. Edited original text masks the original
           // glyphs with the sampled page colour; user-added text masks only if
@@ -1245,8 +1263,8 @@ export default function PDFEditor() {
     { id: 'line', label: 'Line', icon: '╱' },
     { id: 'arrow', label: 'Arrow', icon: '➜' },
     { id: 'whiteout', label: 'Whiteout', icon: '⬜' },
-    { id: 'image', label: 'Image', icon: '🖼' },
-    { id: 'signature', label: 'Sign', icon: '✍' },
+    { id: 'image', label: 'Add Image', icon: '🖼' },
+    { id: 'signature', label: 'Add Signature', icon: '✍' },
   ];
 
   return (
@@ -1305,7 +1323,7 @@ export default function PDFEditor() {
 
       {/* ROW 3: Actions */}
       <div style={barStyle()}>
-        <button onClick={() => inputRef.current?.click()} style={btnStyle()}>📁 Replace</button>
+        <button onClick={() => inputRef.current?.click()} style={btnStyle()}><img className="invert-on-dark" src="/replace-file.png" alt="" width={14} height={14} style={{ verticalAlign: 'middle', marginRight: '5px' }} /> Replace</button>
         <div style={divider()} />
         <button onClick={handleUndo} disabled={!canUndo} style={btnStyle(!canUndo)}>↶</button>
         <button onClick={handleRedo} disabled={!canRedo} style={btnStyle(!canRedo)}>↷</button>
@@ -1325,8 +1343,8 @@ export default function PDFEditor() {
         <button onClick={() => zoomBy(-0.1)} style={btnStyle()}>−</button>
         <span style={{ fontSize: '13px', color: 'var(--color-body)', minWidth: '44px', textAlign: 'center' }}>{Math.round(scale * 100)}%</span>
         <button onClick={() => zoomBy(0.1)} style={btnStyle()}>+</button>
-        <button onClick={fitToWidth} style={btnStyle()}>Fit W</button>
-        <button onClick={fitToPage} style={btnStyle()}>Fit P</button>
+        <button onClick={fitToWidth} style={btnStyle()}>Fit To Width</button>
+        <button onClick={fitToPage} style={btnStyle()}>Fit To Page</button>
       </div>
 
       {/* CANVAS AREA - centered, large */}

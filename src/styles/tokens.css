@@ -98,3 +98,9 @@
   --color-selection-fg: #171717;
   color-scheme: dark;
 }
+
+/* Monochrome (dark-glyph) raster icons: invert in dark mode so they remain
+   visible against the dark canvas. Light mode leaves them untouched. */
+[data-theme="dark"] .invert-on-dark {
+  filter: invert(1) brightness(1.15);
+}
