@@ -62,6 +62,10 @@ export default function PDFEditor() {
   // importing the text layer so edited text can keep the original typeface.
   const fontDataRef = useRef<Record<string, { bytes: Uint8Array }>>({});
   const saveRef = useRef<() => void>(() => {});
+  // Per-object delete (X) control + the handler it invokes (kept in a ref so the
+  // control, created once, always calls the latest logic).
+  const deleteControlRef = useRef<any>(null);
+  const deleteObjectRef = useRef<(obj: any) => void>(() => {});
 
   const annotationsRef = useRef<Record<string, any>>({});
   const rotationsRef = useRef<Record<string, number>>({});
@@ -86,6 +90,49 @@ export default function PDFEditor() {
     const handler = () => saveRef.current();
     window.addEventListener('pdf:download', handler);
     return () => window.removeEventListener('pdf:download', handler);
+  }, []);
+
+  // Build the per-object delete control once. It renders a red circle with a white
+  // "X" at the top-right corner of any selected object and has an enlarged touch
+  // area (touchSizeX/Y) so it's easy to hit on a phone.
+  useEffect(() => {
+    const renderDeleteIcon = (
+      ctx: CanvasRenderingContext2D, left: number, top: number,
+      _styleOverride: any, fabricObject: any
+    ) => {
+      const size = 24;
+      ctx.save();
+      ctx.translate(left, top);
+      ctx.rotate(((fabricObject?.angle || 0) * Math.PI) / 180);
+      ctx.beginPath();
+      ctx.arc(0, 0, size / 2, 0, Math.PI * 2);
+      ctx.fillStyle = '#ef4444';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+      const r = size * 0.22;
+      ctx.beginPath();
+      ctx.moveTo(-r, -r); ctx.lineTo(r, r);
+      ctx.moveTo(r, -r); ctx.lineTo(-r, r);
+      ctx.lineWidth = 2;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+      ctx.restore();
+    };
+    deleteControlRef.current = new fabric.Control({
+      x: 0.5, y: -0.5,
+      offsetX: 14, offsetY: -14,
+      sizeX: 24, sizeY: 24,
+      touchSizeX: 44, touchSizeY: 44,
+      cursorStyle: 'pointer',
+      mouseUpHandler: (_eventData: any, transform: any) => {
+        deleteObjectRef.current(transform?.target);
+        return true;
+      },
+      render: renderDeleteIcon,
+    } as any);
   }, []);
 
   // Tell the navbar whether a PDF is loaded (controls Download button visibility).
@@ -236,7 +283,15 @@ export default function PDFEditor() {
     } catch { return '#ffffff'; }
   };
 
+  // Give every object a large, touch-friendly delete (X) control. Attaching on
+  // object:added covers freshly drawn objects and everything restored from JSON
+  // (loadFromJSON adds objects through canvas.add, which fires object:added).
+  const attachDeleteControl = (obj: any) => {
+    if (obj && deleteControlRef.current && obj.controls) obj.controls.deleteControl = deleteControlRef.current;
+  };
+
   const attachCanvasEvents = (canvas: fabric.Canvas) => {
+    canvas.on('object:added', (e: any) => { if (e.target) attachDeleteControl(e.target); });
     canvas.on('mouse:down', (opt) => {
       const tool = toolRef.current;
       const s = styleRef.current;
@@ -530,9 +585,31 @@ export default function PDFEditor() {
     });
   };
 
+  // Delete a single object. Imported original text is never physically removed —
+  // it's blanked and kept so its original glyphs get masked out (true deletion) on
+  // export; everything else is removed outright.
+  const deleteObject = (obj: any) => {
+    const canvas = fabricRef.current;
+    if (!canvas || !obj) return;
+    if (obj._isOriginal) {
+      obj.set({ text: '', backgroundColor: obj._maskColor || '#ffffff', fill: 'transparent' });
+      obj._edited = true;
+    } else {
+      canvas.remove(obj);
+    }
+    canvas.discardActiveObject();
+    setHasSelection(false);
+    canvas.requestRenderAll();
+    saveHistory();
+  };
+  // Keep the delete control (created once) pointing at the latest handler.
+  useEffect(() => { deleteObjectRef.current = deleteObject; });
+
   const handleDeleteSelected = () => {
     const canvas = fabricRef.current; if (!canvas) return;
-    canvas.getActiveObjects().forEach(o => {
+    const targets = canvas.getActiveObjects();
+    if (!targets.length) return;
+    targets.forEach(o => {
       const obj = o as any;
       if (obj._isOriginal) {
         // Don't physically remove imported original text — blank it and keep it
@@ -543,7 +620,7 @@ export default function PDFEditor() {
         canvas.remove(o);
       }
     });
-    canvas.discardActiveObject(); canvas.renderAll(); saveHistory();
+    canvas.discardActiveObject(); setHasSelection(false); canvas.renderAll(); saveHistory();
   };
 
   const handleDuplicateObject = async () => {
@@ -570,6 +647,24 @@ export default function PDFEditor() {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [currentIndex, pageList]);
+
+  // Keep Fabric's cached pointer offset in sync. Mobile browsers fire scrolls and
+  // viewport resizes (address-bar show/hide, orientation, soft keyboard) that can
+  // leave the cached offset stale, which makes taps land slightly off. Recalculating
+  // on these events keeps touch hit-testing aligned with what's on screen.
+  useEffect(() => {
+    if (!pdfData) return;
+    const recalc = () => fabricRef.current?.calcOffset();
+    const area = canvasAreaRef.current;
+    area?.addEventListener('scroll', recalc, { passive: true });
+    window.addEventListener('resize', recalc);
+    window.addEventListener('orientationchange', recalc);
+    return () => {
+      area?.removeEventListener('scroll', recalc);
+      window.removeEventListener('resize', recalc);
+      window.removeEventListener('orientationchange', recalc);
+    };
+  }, [pdfData]);
 
   const handleImageSelected = async (file: File) => {
     const canvas = fabricRef.current; if (!canvas) return;
@@ -801,7 +896,11 @@ export default function PDFEditor() {
         // Load annotations into an offscreen canvas to read objects
         const el = document.createElement('canvas');
         el.width = baseW; el.height = baseH;
-        const tmp = new fabric.StaticCanvas(el, { width: baseW, height: baseH });
+        // Disable retina scaling on the offscreen export canvas: on high-DPI phones
+        // (devicePixelRatio 2–3) a retina-scaled canvas combined with the 3x raster
+        // multiplier below can exceed mobile canvas pixel limits (iOS ~16.7M px),
+        // which silently drops or shifts rasterised content. Geometry is unaffected.
+        const tmp = new fabric.StaticCanvas(el, { width: baseW, height: baseH, enableRetinaScaling: false });
         await tmp.loadFromJSON(ann);
         const allObjects = tmp.getObjects();
         const isTextObj = (o: any) => o instanceof fabric.Text || o instanceof fabric.IText || o instanceof fabric.Textbox;
@@ -843,7 +942,15 @@ export default function PDFEditor() {
           }
           const fillStr = (t.fill && t.fill !== 'transparent') ? t.fill : (t._origColor || '#171717');
           const textColor = parseColor(fillStr);
-          const lineHeight = size * 1.16;
+          // Match Fabric's on-screen text metrics so the saved PDF lines up with
+          // what the editor preview shows. Fabric draws the first line's (alphabetic)
+          // baseline at fontSize * _fontSizeMult below the box top and advances each
+          // line by lineHeight * _fontSizeMult (defaults: lineHeight 1.16,
+          // _fontSizeMult 1.13). The previous 0.8 / 1.16 approximation drew text
+          // ~0.33*fontSize too high and packed multi-line text too tightly.
+          const FONT_SIZE_MULT = 1.13;
+          const lineHeight = size * 1.16 * FONT_SIZE_MULT;
+          const firstBaseline = size * FONT_SIZE_MULT;
 
           // Cover what was underneath. Edited original text masks the original
           // glyphs with the sampled page colour; user-added text masks only if
@@ -868,7 +975,7 @@ export default function PDFEditor() {
               if (t.textAlign === 'center') x = left + (boxW - tw) / 2;
               else if (t.textAlign === 'right') x = left + (boxW - tw);
             } catch {}
-            const yBaseline = baseH - top - size * 0.8 - i * lineHeight;
+            const yBaseline = baseH - top - firstBaseline - i * lineHeight;
             try {
               pageRef.drawText(line, { x, y: yBaseline, size, font, color: textColor });
             } catch {
