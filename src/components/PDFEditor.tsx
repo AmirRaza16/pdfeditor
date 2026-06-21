@@ -205,13 +205,16 @@ export default function PDFEditor() {
           const base = page.getViewport({ scale: 1, rotation });
           baseW = base.width; baseH = base.height;
           const viewport = page.getViewport({ scale, rotation });
-          dispW = viewport.width; dispH = viewport.height;
+          // Use identical integer pixel dimensions for the PDF and Fabric canvases
+          // so the editable overlay lines up exactly with the rendered page (a
+          // fractional vs truncated size made the overlay drift on mobile).
+          dispW = Math.round(viewport.width); dispH = Math.round(viewport.height);
           pdfCanvas.width = dispW; pdfCanvas.height = dispH;
           await page.render({ canvasContext: pdfCanvas.getContext('2d')!, viewport }).promise;
         } else {
           const size = blankSizesRef.current[key] || defaultSizeRef.current;
           baseW = size.w; baseH = size.h;
-          dispW = baseW * scale; dispH = baseH * scale;
+          dispW = Math.round(baseW * scale); dispH = Math.round(baseH * scale);
           pdfCanvas.width = dispW; pdfCanvas.height = dispH;
           const ctx = pdfCanvas.getContext('2d')!;
           ctx.fillStyle = '#ffffff';
@@ -221,7 +224,13 @@ export default function PDFEditor() {
 
         // Init / resize fabric canvas
         if (!fabricRef.current) {
-          fabricRef.current = new fabric.Canvas(fabricCanvasElRef.current!, { width: dispW, height: dispH, allowTouchScrolling: true });
+          // enableRetinaScaling:false keeps the Fabric overlay at the same 1x pixel
+          // scale as the (non-retina) PDF canvas above. On high-DPI phones the retina
+          // pipeline made Fabric's pointer mapping and overlay scale diverge from the
+          // page, so taps registered offset (up/left) and saved text drifted from what
+          // the preview showed. Matching the scales fixes both; on 1x desktops (where
+          // it already worked) this is a no-op.
+          fabricRef.current = new fabric.Canvas(fabricCanvasElRef.current!, { width: dispW, height: dispH, allowTouchScrolling: true, enableRetinaScaling: false });
           fabricRef.current.allowTouchScrolling = true;
           const wrapper = fabricRef.current.wrapperEl;
           if (wrapper) { wrapper.style.position = 'absolute'; wrapper.style.top = '0'; wrapper.style.left = '0'; }
