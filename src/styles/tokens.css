@@ -76,3 +76,25 @@
   --typo-body-sm-strong-line-height: 20px;
   --typo-body-sm-strong-letter-spacing: -0.28px;
 }
+
+/* Dark theme — toggled via <html data-theme="dark"> */
+:root[data-theme="dark"] {
+  --color-primary: #ededed;
+  --color-on-primary: #171717;
+  --color-ink: #ededed;
+  --color-body: #b4b4b4;
+  --color-mute: #8a8a8a;
+  --color-hairline: #333333;
+  --color-hairline-strong: #5a5a5a;
+  --color-canvas: #1e1e1e;
+  --color-canvas-soft: #181818;
+  --color-canvas-soft-2: #0f0f0f;
+  --color-link: #3b9bff;
+  --color-link-deep: #1f7ae0;
+  --color-link-bg-soft: #16314f;
+  --color-error: #ff6166;
+  --color-error-soft: #4a1f21;
+  --color-selection-bg: #ededed;
+  --color-selection-fg: #171717;
+  color-scheme: dark;
+}

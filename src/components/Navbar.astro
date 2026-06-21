@@ -2,11 +2,35 @@
 ---
 
 <nav class="nav-bar">
-  <div class="logo">
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-    </svg>
-    <span>PDF Editor</span>
+  <div class="logo" aria-label="PDF Editor">
+    <img class="logo-img logo-light" src="/logo-black.svg" alt="PDF Editor" />
+    <img class="logo-img logo-dark" src="/logo-white.svg" alt="PDF Editor" />
+    <span class="visually-hidden" style="margin-left: 8px;">PDF Editor</span>
+  </div>
+
+  <div class="nav-actions">
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
+      <!-- Shown in light mode (click to go dark) -->
+      <svg class="icon icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+      <!-- Shown in dark mode (click to go light) -->
+      <svg class="icon icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="5"/>
+        <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+        <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+    </button>
+
+    <button id="nav-download" class="download-btn" type="button" aria-label="Download PDF">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      <span class="download-label">Download</span>
+    </button>
   </div>
 </nav>
 
@@ -18,14 +42,96 @@
     padding: var(--space-sm) var(--space-lg);
     display: flex;
     align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
     border-bottom: 1px solid var(--color-hairline);
   }
 
   .logo {
     display: flex;
     align-items: center;
-    gap: 12px;
-    font-size: 16px;
+    text-decoration: none;
+  }
+  .logo-img { height: 32px; width: auto; display: block; }
+  .logo-dark { display: none; }
+  :global([data-theme='dark']) .logo-light { display: none; }
+  :global([data-theme='dark']) .logo-dark { display: block; }
+
+  .nav-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+  }
+
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border-radius: var(--rounded-pill);
+    border: 1px solid var(--color-hairline);
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    cursor: pointer;
+  }
+  .icon-btn:hover { background-color: var(--color-canvas-soft-2); }
+  .icon-sun { display: none; }
+  :global([data-theme='dark']) .icon-moon { display: none; }
+  :global([data-theme='dark']) .icon-sun { display: block; }
+
+  .download-btn {
+    display: none; /* shown once a PDF is loaded */
+    align-items: center;
+    gap: 8px;
+    height: 38px;
+    padding: 0 18px;
+    border: none;
+    border-radius: var(--rounded-pill);
+    background-color: var(--color-link);
+    color: #fff;
+    font-size: 14px;
     font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .download-btn:hover { background-color: var(--color-link-deep); }
+  .download-btn.is-visible { display: inline-flex; }
+
+  @media (max-width: 480px) {
+    .nav-bar { padding: var(--space-sm) var(--space-md); }
+    .logo-img { height: 26px; }
+    .download-label { display: none; } /* icon-only on very small screens */
+    .download-btn { padding: 0 12px; }
   }
 </style>
+
+<script is:inline>
+  (function () {
+    var root = document.documentElement;
+
+    // --- Theme toggle ---
+    var toggle = document.getElementById('theme-toggle');
+    if (toggle) {
+      toggle.addEventListener('click', function () {
+        var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        root.setAttribute('data-theme', next);
+        try { localStorage.setItem('theme', next); } catch (e) {}
+      });
+    }
+
+    // --- Download button bridges to the React editor via a custom event ---
+    var dl = document.getElementById('nav-download');
+    if (dl) {
+      dl.addEventListener('click', function () {
+        window.dispatchEvent(new CustomEvent('pdf:download'));
+      });
+    }
+    // The editor tells us whether a PDF is currently loaded.
+    window.addEventListener('pdf:loaded', function (e) {
+      if (!dl) return;
+      var loaded = e && e.detail && e.detail.loaded;
+      dl.classList.toggle('is-visible', !!loaded);
+    });
+  })();
+</script>

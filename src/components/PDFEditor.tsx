@@ -1,14 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { PDFDocument, degrees, rgb, StandardFonts } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
 import * as fabric from 'fabric';
 import SignaturePad from './SignaturePad';
+import { ALL_FONTS, isWebFont, nearestWeight, getWebFontBytes, ensureWebFontFace, fallbackStandardFamily } from './fonts';
 
 type Tool = 'select' | 'text' | 'edittext' | 'rect' | 'ellipse' | 'line' | 'arrow' | 'highlight' | 'draw' | 'whiteout' | 'image' | 'signature';
 
 interface PageEntry { id: string; src: number | null; }
 
-const FONTS = ['Helvetica', 'Arial', 'Times New Roman', 'Courier', 'Georgia', 'Verdana'];
+const FONTS = ALL_FONTS;
 const DEFAULT_SIZE = { w: 595.28, h: 841.89 }; // A4 in points
+const PDFJS_WORKER = 'https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
+// Custom fabric properties that must survive toObject/loadFromJSON round-trips.
+const EXTRA_PROPS = ['_isOriginal', '_origText', '_origColor', '_maskColor', '_maskW', '_maskH', '_origLeft', '_origTop', '_fontKey', '_fallbackFamily', '_origFamily', '_origWeight', '_origItalic', '_whiteout', '_edited'];
 
 export default function PDFEditor() {
   const [pdfData, setPdfData] = useState<Uint8Array | null>(null);
@@ -23,6 +28,13 @@ export default function PDFEditor() {
   const [notice, setNotice] = useState<{ message: string; type: 'info' | 'error' | 'success' } | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Password-protected PDF handling
+  const [passwordPrompt, setPasswordPrompt] = useState(false);
+  const [passwordValue, setPasswordValue] = useState('');
+  const [passwordError, setPasswordError] = useState('');
+  const passwordRef = useRef<string>('');
+  const pendingDataRef = useRef<Uint8Array | null>(null);
+
   const showNotice = useCallback((message: string, type: 'info' | 'error' | 'success' = 'info') => {
     setNotice({ message, type });
     if (noticeTimer.current) clearTimeout(noticeTimer.current);
@@ -34,6 +46,7 @@ export default function PDFEditor() {
   const [fillColor, setFillColor] = useState('#ffeb3b');
   const [fontSize, setFontSize] = useState(18);
   const [fontFamily, setFontFamily] = useState('Helvetica');
+  const [fontWeight, setFontWeight] = useState(400);
   const [strokeWidth, setStrokeWidth] = useState(2);
   const [opacity, setOpacity] = useState(100);
 
@@ -44,6 +57,11 @@ export default function PDFEditor() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const pdfjsDocRef = useRef<any>(null);
   const canvasAreaRef = useRef<HTMLDivElement>(null);
+  const editTextLoadedRef = useRef(false);
+  // Original embedded font programs, keyed by pdf.js fontName, captured while
+  // importing the text layer so edited text can keep the original typeface.
+  const fontDataRef = useRef<Record<string, { bytes: Uint8Array }>>({});
+  const saveRef = useRef<() => void>(() => {});
 
   const annotationsRef = useRef<Record<string, any>>({});
   const rotationsRef = useRef<Record<string, number>>({});
@@ -57,11 +75,23 @@ export default function PDFEditor() {
   const [canRedo, setCanRedo] = useState(false);
 
   const toolRef = useRef(activeTool);
-  const styleRef = useRef({ color, fillColor, fontSize, fontFamily, strokeWidth });
+  const styleRef = useRef({ color, fillColor, fontSize, fontFamily, fontWeight, strokeWidth });
   const scaleRef = useRef(scale);
   useEffect(() => { toolRef.current = activeTool; }, [activeTool]);
-  useEffect(() => { styleRef.current = { color, fillColor, fontSize, fontFamily, strokeWidth }; }, [color, fillColor, fontSize, fontFamily, strokeWidth]);
+  useEffect(() => { styleRef.current = { color, fillColor, fontSize, fontFamily, fontWeight, strokeWidth }; }, [color, fillColor, fontSize, fontFamily, fontWeight, strokeWidth]);
   useEffect(() => { scaleRef.current = scale; }, [scale]);
+
+  // Bridge to the navbar Download button (Astro) via a custom event.
+  useEffect(() => {
+    const handler = () => saveRef.current();
+    window.addEventListener('pdf:download', handler);
+    return () => window.removeEventListener('pdf:download', handler);
+  }, []);
+
+  // Tell the navbar whether a PDF is loaded (controls Download button visibility).
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('pdf:loaded', { detail: { loaded: !!pdfData } }));
+  }, [pdfData]);
 
   const numPages = pageList.length;
   const currentKey = () => pageList[currentIndex]?.id;
@@ -79,7 +109,7 @@ export default function PDFEditor() {
     const canvas = fabricRef.current;
     const key = currentKey();
     if (!canvas || !key) return;
-    const json = JSON.stringify(canvas.toJSON());
+    const json = JSON.stringify(canvas.toObject(EXTRA_PROPS));
     if (!historyRef.current[key]) {
       historyRef.current[key] = [];
       historyIndexRef.current[key] = -1;
@@ -96,7 +126,7 @@ export default function PDFEditor() {
   const saveCurrentAnnotations = () => {
     const canvas = fabricRef.current;
     const key = currentKey();
-    if (canvas && key) annotationsRef.current[key] = JSON.stringify(canvas.toJSON());
+    if (canvas && key) annotationsRef.current[key] = JSON.stringify(canvas.toObject(EXTRA_PROPS));
   };
 
   // Render current page
@@ -110,10 +140,10 @@ export default function PDFEditor() {
         setProcessingStatus('Rendering page...');
 
         const pdfjsLib = await import('pdfjs-dist');
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
+        pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
 
         if (!pdfjsDocRef.current) {
-          pdfjsDocRef.current = await pdfjsLib.getDocument({ data: pdfData.slice(0), password: '' }).promise;
+          pdfjsDocRef.current = await pdfjsLib.getDocument({ data: pdfData.slice(0), password: passwordRef.current }).promise;
         }
         const pdf = pdfjsDocRef.current;
         const entry = pageList[currentIndex];
@@ -144,7 +174,8 @@ export default function PDFEditor() {
 
         // Init / resize fabric canvas
         if (!fabricRef.current) {
-          fabricRef.current = new fabric.Canvas(fabricCanvasElRef.current!, { width: dispW, height: dispH });
+          fabricRef.current = new fabric.Canvas(fabricCanvasElRef.current!, { width: dispW, height: dispH, allowTouchScrolling: true });
+          fabricRef.current.allowTouchScrolling = true;
           const wrapper = fabricRef.current.wrapperEl;
           if (wrapper) { wrapper.style.position = 'absolute'; wrapper.style.top = '0'; wrapper.style.left = '0'; }
           attachCanvasEvents(fabricRef.current);
@@ -160,7 +191,7 @@ export default function PDFEditor() {
           await canvas.loadFromJSON(saved);
           canvas.renderAll();
         } else if (!historyRef.current[key]) {
-          historyRef.current[key] = [JSON.stringify(canvas.toJSON())];
+          historyRef.current[key] = [JSON.stringify(canvas.toObject(EXTRA_PROPS))];
           historyIndexRef.current[key] = 0;
         }
         applyToolMode(canvas, toolRef.current);
@@ -181,23 +212,48 @@ export default function PDFEditor() {
 
   const drawState = useRef<{ obj: fabric.Object | null; startX: number; startY: number }>({ obj: null, startX: 0, startY: 0 });
 
+  // Sample the rendered page's background colour over a region (point space).
+  // Returns the average of the lightest pixels so a mask blends with the page.
+  const samplePageColor = (xPt: number, topPt: number, wPt: number, hPt: number): string => {
+    const cnv = pdfCanvasRef.current; if (!cnv) return '#ffffff';
+    const ctx = (cnv.getContext('2d', { willReadFrequently: true } as any) || cnv.getContext('2d')) as CanvasRenderingContext2D | null;
+    if (!ctx) return '#ffffff';
+    const s = scaleRef.current;
+    const cw = cnv.width, ch = cnv.height;
+    const sx = Math.min(cw - 1, Math.max(0, Math.round(xPt * s)));
+    const sy = Math.min(ch - 1, Math.max(0, Math.round(topPt * s)));
+    const sw = Math.max(1, Math.min(cw - sx, Math.round(wPt * s)));
+    const sh = Math.max(1, Math.min(ch - sy, Math.round(hPt * s)));
+    try {
+      const d = ctx.getImageData(sx, sy, sw, sh).data;
+      let maxLum = -1;
+      const lum = (i: number) => d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+      for (let i = 0; i < d.length; i += 4) { const l = lum(i); if (l > maxLum) maxLum = l; }
+      let n = 0, ar = 0, ag = 0, ab = 0; const thresh = maxLum - 12;
+      for (let i = 0; i < d.length; i += 4) { if (lum(i) >= thresh) { ar += d[i]; ag += d[i + 1]; ab += d[i + 2]; n++; } }
+      const r = n ? Math.round(ar / n) : 255, g = n ? Math.round(ag / n) : 255, b = n ? Math.round(ab / n) : 255;
+      return (r >= 248 && g >= 248 && b >= 248) ? '#ffffff' : `rgb(${r},${g},${b})`;
+    } catch { return '#ffffff'; }
+  };
+
   const attachCanvasEvents = (canvas: fabric.Canvas) => {
     canvas.on('mouse:down', (opt) => {
       const tool = toolRef.current;
       const s = styleRef.current;
-      if (tool === 'select' || tool === 'draw') return;
+      if (tool === 'select' || tool === 'draw' || tool === 'edittext') return;
       const p = canvas.getScenePoint(opt.e);
 
       if (tool === 'text') {
-        const tb = new fabric.Textbox('Type here', { left: p.x, top: p.y, fontSize: s.fontSize, fill: s.color, fontFamily: s.fontFamily, width: 200, editable: true });
+        const tb = new fabric.Textbox('Type here', { left: p.x, top: p.y, fontSize: s.fontSize, fill: s.color, fontFamily: s.fontFamily, fontWeight: s.fontWeight, width: 200, editable: true });
         canvas.add(tb); canvas.setActiveObject(tb); tb.enterEditing(); tb.selectAll();
+        if (isWebFont(s.fontFamily)) ensureWebFontFace(s.fontFamily, s.fontWeight, false).then(() => canvas.requestRenderAll());
         setActiveTool('select'); saveHistory(); return;
       }
 
       drawState.current.startX = p.x; drawState.current.startY = p.y;
       let obj: fabric.Object | null = null;
       if (tool === 'rect') obj = new fabric.Rect({ left: p.x, top: p.y, width: 1, height: 1, fill: 'transparent', stroke: s.color, strokeWidth: s.strokeWidth });
-      else if (tool === 'whiteout') obj = new fabric.Rect({ left: p.x, top: p.y, width: 1, height: 1, fill: '#ffffff', stroke: '#ffffff', strokeWidth: 1 });
+      else if (tool === 'whiteout') { obj = new fabric.Rect({ left: p.x, top: p.y, width: 1, height: 1, fill: '#ffffff', stroke: '#ffffff', strokeWidth: 0 }); (obj as any)._whiteout = true; }
       else if (tool === 'highlight') obj = new fabric.Rect({ left: p.x, top: p.y, width: 1, height: 1, fill: s.fillColor, opacity: 0.4, stroke: 'transparent' });
       else if (tool === 'ellipse') obj = new fabric.Ellipse({ left: p.x, top: p.y, rx: 1, ry: 1, fill: 'transparent', stroke: s.color, strokeWidth: s.strokeWidth });
       else if (tool === 'line' || tool === 'arrow') obj = new fabric.Line([p.x, p.y, p.x, p.y], { stroke: s.color, strokeWidth: s.strokeWidth });
@@ -231,17 +287,61 @@ export default function PDFEditor() {
       }
       const o = ds.obj as any;
       if ((o.width !== undefined && o.width < 3 && o.height < 3) && tool !== 'line' && tool !== 'arrow') canvas.remove(ds.obj);
+      else if (tool === 'whiteout') {
+        // Blend the whiteout with the page: fill it with the sampled background.
+        const c = samplePageColor(o.left || 0, o.top || 0, (o.width || 1), (o.height || 1));
+        o.set({ fill: c, stroke: c, strokeWidth: 0 });
+        o._whiteout = true; o._maskColor = c;
+      }
       drawState.current.obj = null;
       canvas.renderAll();
       setActiveTool('select');
       saveHistory();
     });
 
-    canvas.on('object:modified', saveHistory);
+    canvas.on('object:modified', (e: any) => {
+      const tgt = e?.target;
+      const list = tgt?._objects ? tgt._objects : (tgt ? [tgt] : []);
+      list.forEach((o: any) => { if (o?._isOriginal) o._edited = true; });
+      saveHistory();
+    });
     canvas.on('path:created', saveHistory);
-    canvas.on('selection:created', () => setHasSelection(true));
-    canvas.on('selection:updated', () => setHasSelection(true));
-    canvas.on('selection:cleared', () => setHasSelection(false));
+
+    // --- Original-text overlays (Edit Text) ---
+    // Imported text starts invisible so the page keeps its exact original look.
+    // A box is "revealed" (covers the original + becomes visible) only while
+    // selected or after the user edits it.
+    const isEdited = (o: any) => o && o._isOriginal &&
+      (o._edited === true || String(o.text ?? '') !== String(o._origText ?? ''));
+    const reveal = (o: any) => {
+      if (o && o._isOriginal) {
+        o.set({ fill: o._origColor || '#171717', backgroundColor: o._maskColor || '#ffffff' });
+      }
+    };
+    const hideIfPristine = (o: any) => {
+      if (o && o._isOriginal && !isEdited(o)) {
+        o.set({ fill: 'transparent', backgroundColor: 'transparent' });
+      }
+    };
+    const hideAllPristine = () => { canvas.forEachObject(hideIfPristine); canvas.requestRenderAll(); };
+
+    const syncToolbar = (sel: any[]) => {
+      const o = sel && sel.length === 1 ? sel[0] : null;
+      if (!o || !(o instanceof fabric.Textbox || o instanceof fabric.IText || o instanceof fabric.Text)) return;
+      const oo = o as any;
+      if (typeof oo.fontSize === 'number') setFontSize(Math.max(6, Math.round(oo.fontSize * (oo.scaleY || 1))));
+      const w = Number(oo.fontWeight) || (oo.fontWeight === 'bold' ? 700 : 400);
+      setFontWeight(Math.min(900, Math.max(100, Math.round(w / 100) * 100)));
+      const fam = oo._isOriginal ? (oo._fallbackFamily || 'Helvetica') : oo.fontFamily;
+      if (FONTS.includes(fam)) setFontFamily(fam);
+    };
+
+    canvas.on('selection:created', (e: any) => { (e.selected || []).forEach(reveal); syncToolbar(e.selected || []); canvas.requestRenderAll(); setHasSelection(true); });
+    canvas.on('selection:updated', (e: any) => { (e.deselected || []).forEach(hideIfPristine); (e.selected || []).forEach(reveal); syncToolbar(e.selected || []); canvas.requestRenderAll(); setHasSelection(true); });
+    canvas.on('selection:cleared', () => { hideAllPristine(); setHasSelection(false); });
+    canvas.on('text:editing:entered', (e: any) => { reveal(e.target); canvas.requestRenderAll(); });
+    canvas.on('text:changed', (e: any) => { if (e.target?._isOriginal) e.target._edited = true; });
+    canvas.on('text:editing:exited', () => { hideAllPristine(); saveHistory(); });
   };
 
   const applyToolMode = (canvas: fabric.Canvas, tool: Tool) => {
@@ -252,10 +352,10 @@ export default function PDFEditor() {
       brush.width = styleRef.current.strokeWidth + 1;
       canvas.freeDrawingBrush = brush;
     }
-    const selectable = tool === 'select';
+    const selectable = tool === 'select' || tool === 'edittext';
     canvas.selection = selectable;
     canvas.forEachObject(o => { o.selectable = selectable; o.evented = selectable; });
-    canvas.defaultCursor = tool === 'select' ? 'default' : 'crosshair';
+    canvas.defaultCursor = selectable ? 'default' : 'crosshair';
     canvas.renderAll();
   };
 
@@ -264,7 +364,14 @@ export default function PDFEditor() {
     if (!canvas) return;
     if (activeTool === 'image') { imageInputRef.current?.click(); setActiveTool('select'); return; }
     if (activeTool === 'signature') { setShowSignaturePad(true); setActiveTool('select'); return; }
-    if (activeTool === 'edittext') { loadTextLayer(); setActiveTool('select'); return; }
+    if (activeTool === 'edittext') {
+      // Keep the Edit Text tool visually active; the canvas behaves like Select
+      // so the user can click and edit the imported text boxes.
+      if (!editTextLoadedRef.current) { editTextLoadedRef.current = true; loadTextLayer(); }
+      applyToolMode(canvas, 'edittext');
+      return;
+    }
+    editTextLoadedRef.current = false;
     applyToolMode(canvas, activeTool);
   }, [activeTool]);
 
@@ -289,36 +396,110 @@ export default function PDFEditor() {
       const cw = pdfCanvasRef.current?.width || 0;
       const ch = pdfCanvasRef.current?.height || 0;
 
-      const sampleBg = (xPt: number, yPt: number): string => {
-        // Sample the page background just above a text item (in display px)
-        if (!pdfCtx || !cw || !ch) return '#ffffff';
+      // Sample the page background and text colour inside a text item's box so
+      // a re-drawn edit blends in. Background = average of the lightest pixels
+      // (ignores the glyph strokes); text colour = the darkest pixel.
+      const sampleRegion = (xPt: number, topPt: number, wPt: number, hPt: number): { bg: string; fg: string } => {
+        const fallback = { bg: '#ffffff', fg: '#171717' };
+        if (!pdfCtx || !cw || !ch) return fallback;
         const sx = Math.min(cw - 1, Math.max(0, Math.round(xPt * scale)));
-        const sy = Math.min(ch - 1, Math.max(0, Math.round(yPt * scale) - 3));
+        const sy = Math.min(ch - 1, Math.max(0, Math.round(topPt * scale)));
+        const sw = Math.max(1, Math.min(cw - sx, Math.round(wPt * scale)));
+        const sh = Math.max(1, Math.min(ch - sy, Math.round(hPt * scale)));
         try {
-          const d = pdfCtx.getImageData(sx, sy, 1, 1).data;
-          return `rgb(${d[0]},${d[1]},${d[2]})`;
-        } catch { return '#ffffff'; }
+          const d = pdfCtx.getImageData(sx, sy, sw, sh).data;
+          let maxLum = -1, minLum = 1e9;
+          let dr = 23, dg = 23, db = 23;
+          const lum = (i: number) => d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+          for (let i = 0; i < d.length; i += 4) {
+            const l = lum(i);
+            if (l > maxLum) maxLum = l;
+            if (l < minLum) { minLum = l; dr = d[i]; dg = d[i + 1]; db = d[i + 2]; }
+          }
+          // Average pixels close to the lightest luminance — the true background.
+          let n = 0, ar = 0, ag = 0, ab = 0;
+          const thresh = maxLum - 12;
+          for (let i = 0; i < d.length; i += 4) {
+            if (lum(i) >= thresh) { ar += d[i]; ag += d[i + 1]; ab += d[i + 2]; n++; }
+          }
+          const br = n ? Math.round(ar / n) : 255, bg2 = n ? Math.round(ag / n) : 255, bb = n ? Math.round(ab / n) : 255;
+          const bg = (br >= 248 && bg2 >= 248 && bb >= 248) ? '#ffffff' : `rgb(${br},${bg2},${bb})`;
+          const fg = `rgb(${dr},${dg},${db})`;
+          return { bg, fg };
+        } catch { return fallback; }
       };
 
       let added = 0;
+      const fontStyles = (textContent as any).styles || {};
       textContent.items.forEach((item: any) => {
         if (!item.str || !item.str.trim()) return;
         const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
         const fontHeight = Math.hypot(tx[2], tx[3]);
         if (fontHeight < 2) return;
         const top = tx[5] - fontHeight;
+
+        // Derive font weight / style / family from the PDF's font info so we
+        // don't flatten bold/italic text on import.
+        let fontObj: any = null;
+        try { if (item.fontName && page.commonObjs.has(item.fontName)) fontObj = page.commonObjs.get(item.fontName); } catch { /* not resolved yet */ }
+        const styleInfo = fontStyles[item.fontName] || {};
+        const fontDesc = `${fontObj?.name || ''} ${fontObj?.loadedName || ''} ${styleInfo.fontFamily || ''} ${item.fontName || ''}`.toLowerCase();
+        const isBold = !!fontObj?.bold || /bold|black|heavy|semibold|extrabold|w[6-9]00/.test(fontDesc);
+        const isItalic = !!fontObj?.italic || /italic|oblique/.test(fontDesc);
+        let family = 'Helvetica';
+        if (/times|georgia|roman|serif|garamond|minion|book antiqua/.test(fontDesc)) family = 'Times New Roman';
+        else if (/courier|mono|consol/.test(fontDesc)) family = 'Courier';
+
+        // Stash the original embedded font program so edits keep the typeface.
+        let fontKey = '';
+        if (fontObj && fontObj.data && !fontObj.missingFile && item.fontName) {
+          fontKey = item.fontName;
+          if (!fontDataRef.current[fontKey]) {
+            try { fontDataRef.current[fontKey] = { bytes: fontObj.data as Uint8Array }; } catch { /* ignore */ }
+          }
+        }
+        // pdf.js already registers embedded fonts in the browser under their
+        // loadedName, so we can render the on-screen overlay with the real font.
+        // Default the on-screen edit font to a clean standard family (Helvetica
+        // unless the original is clearly serif/mono). The exact original font is
+        // still embedded on save when the text/family is left unchanged.
+        const displayFamily = family;
+
+        const boxW = Math.max(20, (item.width || item.str.length * fontHeight * 0.5) + 4);
+        const { bg, fg } = sampleRegion(tx[4], top, item.width || boxW, fontHeight * 1.2);
+
+        // Imported text is invisible by default (fill + background transparent),
+        // so the page keeps its exact original appearance until edited.
         const tb = new fabric.Textbox(item.str, {
           left: tx[4], top, fontSize: fontHeight * 0.92,
-          fill: '#171717', fontFamily: 'Helvetica',
-          backgroundColor: sampleBg(tx[4], top),
-          editable: true, width: Math.max(20, (item.width || item.str.length * fontHeight * 0.5) + 4)
+          fill: 'transparent', fontFamily: displayFamily,
+          fontWeight: isBold ? 700 : 400,
+          fontStyle: isItalic ? 'italic' : 'normal',
+          backgroundColor: 'transparent',
+          editable: true, width: boxW
+        });
+        Object.assign(tb as any, {
+          _isOriginal: true,
+          _fallbackFamily: family,
+          _origText: item.str,
+          _origColor: fg,
+          _maskColor: bg,
+          _maskW: item.width || boxW,
+          _maskH: fontHeight * 1.3,
+          _origLeft: tx[4],
+          _origTop: top,
+          _fontKey: fontKey,
+          _origFamily: displayFamily,
+          _origWeight: isBold ? 700 : 400,
+          _origItalic: isItalic,
+          _edited: false,
         });
         canvas.add(tb); added++;
       });
       canvas.renderAll();
       setIsProcessing(false); setProcessingStatus('');
       if (added === 0) showNotice('No editable text layer found — this looks like a scanned/image PDF. You can still add text, shapes, highlights, images and signatures.', 'info');
-      else saveHistory();
+      else { showNotice('Click any text to edit it. Text you don\'t touch keeps its original font and look.', 'success'); saveHistory(); }
     } catch (err) {
       console.error(err); setIsProcessing(false); setProcessingStatus('');
       showNotice('Could not load text layer: ' + (err as Error).message, 'error');
@@ -351,7 +532,17 @@ export default function PDFEditor() {
 
   const handleDeleteSelected = () => {
     const canvas = fabricRef.current; if (!canvas) return;
-    canvas.getActiveObjects().forEach(o => canvas.remove(o));
+    canvas.getActiveObjects().forEach(o => {
+      const obj = o as any;
+      if (obj._isOriginal) {
+        // Don't physically remove imported original text — blank it and keep it
+        // so its original glyphs get masked out (true deletion) on export.
+        obj.set({ text: '', backgroundColor: obj._maskColor || '#ffffff', fill: 'transparent' });
+        obj._edited = true;
+      } else {
+        canvas.remove(o);
+      }
+    });
     canvas.discardActiveObject(); canvas.renderAll(); saveHistory();
   };
 
@@ -398,17 +589,42 @@ export default function PDFEditor() {
     canvas.add(img); canvas.setActiveObject(img); canvas.renderAll(); saveHistory();
   };
 
+  const ensureFacesForActive = () => {
+    const canvas = fabricRef.current; if (!canvas) return;
+    canvas.getActiveObjects().forEach((o: any) => {
+      if (isWebFont(o.fontFamily)) {
+        ensureWebFontFace(o.fontFamily, Number(o.fontWeight) || 400, o.fontStyle === 'italic').then(() => canvas.requestRenderAll());
+      }
+    });
+  };
+
   const applyStyleToSelection = (props: Record<string, any>) => {
     const canvas = fabricRef.current; if (!canvas) return;
     const active = canvas.getActiveObject(); if (!active) return;
-    active.set(props); canvas.renderAll(); saveHistory();
+    canvas.getActiveObjects().forEach(o => { if ((o as any)._isOriginal) (o as any)._edited = true; });
+    active.set(props); ensureFacesForActive(); canvas.renderAll(); saveHistory();
   };
 
   const toggleStyle = (prop: string, onVal: any, offVal: any) => {
     const canvas = fabricRef.current; if (!canvas) return;
     const active = canvas.getActiveObject() as any; if (!active) return;
+    canvas.getActiveObjects().forEach(o => { if ((o as any)._isOriginal) (o as any)._edited = true; });
     active.set(prop, active[prop] === onVal ? offVal : onVal);
-    canvas.renderAll(); saveHistory();
+    ensureFacesForActive(); canvas.renderAll(); saveHistory();
+  };
+
+  // Apply a numeric font weight to the current selection (and remember it for new text).
+  const applyFontWeight = (w: number) => {
+    setFontWeight(w);
+    if (isWebFont(fontFamily)) ensureWebFontFace(fontFamily, w, false).then(() => fabricRef.current?.requestRenderAll());
+    applyStyleToSelection({ fontWeight: w });
+  };
+
+  // Apply a font family to the current selection (and remember it for new text).
+  const applyFontFamily = (family: string) => {
+    setFontFamily(family);
+    if (isWebFont(family)) ensureWebFontFace(family, fontWeight, false).then(() => fabricRef.current?.requestRenderAll());
+    applyStyleToSelection({ fontFamily: family });
   };
 
   // Page operations
@@ -470,12 +686,83 @@ export default function PDFEditor() {
       setIsProcessing(true); setProcessingStatus('Building PDF...');
       saveCurrentAnnotations();
 
-      const srcDoc = await PDFDocument.load(pdfData, { ignoreEncryption: true });
+      let srcDoc: PDFDocument | null = null;
+      try { srcDoc = await PDFDocument.load(pdfData, { ignoreEncryption: true }); } catch { srcDoc = null; }
+      const RASTER_SCALE = 2;
+      const rasterizePage = async (srcIndex: number) => {
+        const page = await pdfjsDocRef.current.getPage(srcIndex + 1);
+        const vp1 = page.getViewport({ scale: 1 });
+        const vp = page.getViewport({ scale: RASTER_SCALE });
+        const c = document.createElement('canvas');
+        c.width = vp.width; c.height = vp.height;
+        await page.render({ canvasContext: c.getContext('2d')!, viewport: vp }).promise;
+        const dataUrl = c.toDataURL('image/png');
+        const bytes = await (await fetch(dataUrl)).arrayBuffer();
+        return { bytes, w: vp1.width, h: vp1.height };
+      };
       const newDoc = await PDFDocument.create();
+      try { newDoc.registerFontkit(fontkit); } catch { /* already registered */ }
       const fontCache = new Map<string, any>();
       const getFont = async (std: string) => {
         if (!fontCache.has(std)) fontCache.set(std, await newDoc.embedFont(std as any));
         return fontCache.get(std);
+      };
+      // Embed the original embedded font (captured on import) so edited text
+      // keeps its exact typeface/weight. Falls back to null if it can't embed.
+      const origFontCache = new Map<string, any>();
+      const getOrigFont = async (fontKey: string) => {
+        if (!fontKey) return null;
+        if (origFontCache.has(fontKey)) return origFontCache.get(fontKey);
+        let f: any = null;
+        const entry = fontDataRef.current[fontKey];
+        if (entry?.bytes) {
+          try {
+            f = await newDoc.embedFont(entry.bytes, { subset: false });
+            try { f.__charset = new Set<number>(f.getCharacterSet()); } catch { f.__charset = null; }
+          } catch { f = null; }
+        }
+        origFontCache.set(fontKey, f);
+        return f;
+      };
+      // True only if the embedded (subset) font actually has every glyph the
+      // edited string needs — otherwise we use a standard fallback font.
+      const fontCovers = (pdfFont: any, text: string): boolean => {
+        try {
+          const set: Set<number> | null = pdfFont?.__charset || null;
+          if (!set) { pdfFont.widthOfTextAtSize(text || ' ', 12); return true; }
+          for (const ch of text) {
+            const cp = ch.codePointAt(0)!;
+            if (cp === 10 || cp === 13) continue;
+            if (!set.has(cp)) return false;
+          }
+          return true;
+        } catch { return false; }
+      };
+      // Resolve the font the user picked from the dropdown/weight slider:
+      // download + embed the matching web font, or fall back to a standard font.
+      const webFontCache = new Map<string, any>();
+      const resolveSelectedFont = async (family: string, weight: number, italic: boolean) => {
+        if (isWebFont(family)) {
+          const w = nearestWeight(family, weight);
+          const key = `${family}-${w}-${italic ? 'i' : 'n'}`;
+          if (webFontCache.has(key)) {
+            const cached = webFontCache.get(key);
+            if (cached) return cached;
+          } else {
+            try {
+              const bytes = await getWebFontBytes(family, weight, italic);
+              if (bytes) {
+                const f = await newDoc.embedFont(bytes.slice(0), { subset: true });
+                try { f.__charset = new Set<number>(f.getCharacterSet()); } catch { f.__charset = null; }
+                webFontCache.set(key, f);
+                return f;
+              }
+            } catch { /* fall through to standard */ }
+            webFontCache.set(key, null);
+          }
+          family = fallbackStandardFamily(family);
+        }
+        return await getFont(pickFont(family, weight >= 600, italic));
       };
 
       for (const entry of pageList) {
@@ -484,9 +771,24 @@ export default function PDFEditor() {
         let pageRef; let baseW: number, baseH: number;
 
         if (entry.src != null) {
-          const [copied] = await newDoc.copyPages(srcDoc, [entry.src]);
-          pageRef = newDoc.addPage(copied);
-          const sz = pageRef.getSize(); baseW = sz.width; baseH = sz.height;
+          let copiedOk = false;
+          if (srcDoc) {
+            try {
+              const [copied] = await newDoc.copyPages(srcDoc, [entry.src]);
+              pageRef = newDoc.addPage(copied);
+              const sz = pageRef.getSize(); baseW = sz.width; baseH = sz.height;
+              copiedOk = true;
+            } catch { copiedOk = false; }
+          }
+          if (!copiedOk) {
+            // Encrypted or uncopyable page — rebuild it from a high-res render
+            // so the original look (including its text) is preserved as an image.
+            const { bytes, w, h } = await rasterizePage(entry.src);
+            baseW = w; baseH = h;
+            pageRef = newDoc.addPage([baseW, baseH]);
+            const img = await newDoc.embedPng(bytes);
+            pageRef.drawImage(img, { x: 0, y: 0, width: baseW, height: baseH });
+          }
         } else {
           const size = blankSizesRef.current[key] || defaultSizeRef.current;
           pageRef = newDoc.addPage([size.w, size.h]); baseW = size.w; baseH = size.h;
@@ -502,38 +804,60 @@ export default function PDFEditor() {
         const tmp = new fabric.StaticCanvas(el, { width: baseW, height: baseH });
         await tmp.loadFromJSON(ann);
         const allObjects = tmp.getObjects();
-        const textObjects = allObjects.filter(o => o instanceof fabric.Text || o instanceof fabric.IText || o instanceof fabric.Textbox);
+        const isTextObj = (o: any) => o instanceof fabric.Text || o instanceof fabric.IText || o instanceof fabric.Textbox;
+        const isWhiteoutObj = (o: any) => o._whiteout === true;
 
-        // 1) Rasterize ONLY non-text objects (shapes, drawings, images) at high DPI
-        textObjects.forEach(t => tmp.remove(t));
-        tmp.renderAll();
-        if (tmp.getObjects().length > 0) {
-          const overlayUrl = tmp.toDataURL({ format: 'png', multiplier: 3 });
-          const pngBytes = await (await fetch(overlayUrl)).arrayBuffer();
-          const png = await newDoc.embedPng(pngBytes);
-          pageRef.drawImage(png, { x: 0, y: 0, width: baseW, height: baseH });
-        }
-        tmp.dispose();
+        // Draw a single text object as crisp vector text (with its mask).
+        const drawTextObject = async (t: any) => {
+          const isOrig = t._isOriginal === true;
+          const changed = isOrig
+            ? (t._edited === true || String(t.text ?? '') !== String(t._origText ?? ''))
+            : true;
+          if (isOrig && !changed) return; // keep original text exactly as-is
 
-        // 2) Draw text as crisp VECTOR text
-        for (const t of textObjects as any[]) {
           const size = (t.fontSize || 16) * (t.scaleY || 1);
           const left = t.left || 0;
           const top = t.top || 0;
           const boxW = (t.width || 0) * (t.scaleX || 1);
-          const bold = t.fontWeight === 'bold' || Number(t.fontWeight) >= 600;
+          const weightNum = Number(t.fontWeight) || (t.fontWeight === 'bold' ? 700 : 400);
+          const bold = weightNum >= 600;
           const italic = t.fontStyle === 'italic';
-          const font = await getFont(pickFont(t.fontFamily, bold, italic));
-          const textColor = parseColor(t.fill);
           const lines = String(t.text ?? '').split('\n');
+          // Keep the original embedded typeface only when the user didn't change
+          // the family/weight/style; otherwise honour the dropdown + weight slider.
+          let font: any = null;
+          if (isOrig && t._fontKey) {
+            const sameFamily = !t._origFamily || t.fontFamily === t._origFamily;
+            const sameWeight = !t._origWeight || weightNum === t._origWeight;
+            const sameItalic = (italic === !!t._origItalic);
+            if (sameFamily && sameWeight && sameItalic) {
+              const of = await getOrigFont(t._fontKey);
+              if (of && fontCovers(of, String(t.text ?? ''))) font = of;
+            }
+          }
+          if (!font) {
+            font = await resolveSelectedFont(t.fontFamily, weightNum, italic);
+            if (font && font.__charset && !fontCovers(font, String(t.text ?? ''))) {
+              font = await getFont(pickFont(t._fallbackFamily || fallbackStandardFamily(t.fontFamily), bold, italic));
+            }
+          }
+          const fillStr = (t.fill && t.fill !== 'transparent') ? t.fill : (t._origColor || '#171717');
+          const textColor = parseColor(fillStr);
           const lineHeight = size * 1.16;
 
-          // Background mask (seamless — uses sampled page color)
-          if (t.backgroundColor && t.backgroundColor !== 'transparent') {
+          // Cover what was underneath. Edited original text masks the original
+          // glyphs with the sampled page colour; user-added text masks only if
+          // it has an explicit background.
+          if (isOrig) {
+            const mw = Math.max(t._maskW || 0, boxW || 0, 10);
+            const contentH = Math.max(t._maskH || size * 1.3, lines.length * lineHeight);
+            const padTop = size * 0.2;
+            const mLeft = (t._origLeft != null) ? t._origLeft : left;
+            const mTop = (t._origTop != null) ? t._origTop : top;
+            try { pageRef.drawRectangle({ x: mLeft, y: baseH - mTop - contentH, width: mw, height: contentH + padTop, color: parseColor(t._maskColor || '#ffffff') }); } catch {}
+          } else if (t.backgroundColor && t.backgroundColor !== 'transparent') {
             const bh = lines.length * lineHeight;
-            try {
-              pageRef.drawRectangle({ x: left, y: baseH - top - bh, width: boxW || 10, height: bh, color: parseColor(t.backgroundColor) });
-            } catch {}
+            try { pageRef.drawRectangle({ x: left, y: baseH - top - bh, width: boxW || 10, height: bh, color: parseColor(t.backgroundColor) }); } catch {}
           }
 
           lines.forEach((line, i) => {
@@ -555,7 +879,42 @@ export default function PDFEditor() {
               } catch {}
             }
           });
+        };
+
+        // Draw a whiteout as a crisp, fully-opaque vector rectangle that blends
+        // with the page background (no raster halo / shadow), so it sits in front
+        // of whatever it covers.
+        const drawWhiteout = (o: any) => {
+          const left = o.left || 0, top = o.top || 0;
+          const w = (o.width || 0) * (o.scaleX || 1), h = (o.height || 0) * (o.scaleY || 1);
+          if (w <= 0 || h <= 0) return;
+          const color = parseColor(o._maskColor || (typeof o.fill === 'string' ? o.fill : '#ffffff'));
+          try { pageRef.drawRectangle({ x: left, y: baseH - top - h, width: w, height: h, color }); } catch {}
+        };
+
+        // Walk objects in z-order. Consecutive shapes/images/drawings are
+        // rasterised together; text and whiteout are drawn as vectors in place,
+        // preserving stacking order (e.g. a whiteout placed over text covers it).
+        allObjects.forEach((o: any) => { o.visible = false; });
+        let batch: any[] = [];
+        const flushBatch = async () => {
+          if (!batch.length) return;
+          batch.forEach(o => { o.visible = true; });
+          tmp.renderAll();
+          const url = tmp.toDataURL({ format: 'png', multiplier: 3 });
+          const pngBytes = await (await fetch(url)).arrayBuffer();
+          const png = await newDoc.embedPng(pngBytes);
+          pageRef.drawImage(png, { x: 0, y: 0, width: baseW, height: baseH });
+          batch.forEach(o => { o.visible = false; });
+          batch = [];
+        };
+        for (const o of allObjects as any[]) {
+          if (isTextObj(o)) { await flushBatch(); await drawTextObject(o); }
+          else if (isWhiteoutObj(o)) { await flushBatch(); drawWhiteout(o); }
+          else { batch.push(o); }
         }
+        await flushBatch();
+        tmp.dispose();
       }
 
       const bytes = await newDoc.save();
@@ -571,42 +930,187 @@ export default function PDFEditor() {
       setIsProcessing(false);
     }
   };
+  saveRef.current = handleSave;
 
-  const handleFileUpload = async (file: File) => {
-    const buffer = await file.arrayBuffer();
+  const openPdfDocument = async (data: Uint8Array, password: string) => {
+    const pdfjsLib = await import('pdfjs-dist');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+    return pdfjsLib.getDocument({ data: data.slice(0), password }).promise;
+  };
+
+  const resetForNewFile = () => {
     annotationsRef.current = {}; rotationsRef.current = {}; blankSizesRef.current = {};
     historyRef.current = {}; historyIndexRef.current = {};
-    pdfjsDocRef.current = null;
+    pdfjsDocRef.current = null; passwordRef.current = '';
+    fontDataRef.current = {};
     fabricRef.current?.dispose(); fabricRef.current = null;
     idCounter.current = 0;
+  };
 
-    const data = new Uint8Array(buffer);
-    // Determine page count + default size
-    const pdfjsLib = await import('pdfjs-dist');
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
-    const doc = await pdfjsLib.getDocument({ data: data.slice(0), password: '' }).promise;
+  const finalizeLoad = async (doc: any, data: Uint8Array, password: string) => {
     pdfjsDocRef.current = doc;
+    passwordRef.current = password;
     const first = await doc.getPage(1);
     const fv = first.getViewport({ scale: 1 });
     defaultSizeRef.current = { w: fv.width, h: fv.height };
     const list: PageEntry[] = [];
     for (let i = 0; i < doc.numPages; i++) list.push({ id: `p${idCounter.current++}`, src: i });
-
+    editTextLoadedRef.current = false;
+    setActiveTool('select');
+    setHasSelection(false);
     setCurrentIndex(0);
     setPageList(list);
     setPdfData(data);
   };
 
+  const handleFileUpload = async (file: File) => {
+    // Validate type — some mobile pickers report empty MIME types, so fall back to extension.
+    const looksPdf = (file.type === 'application/pdf') || file.name.toLowerCase().endsWith('.pdf');
+    if (!looksPdf) { showNotice('Please choose a PDF file.', 'error'); return; }
+
+    try {
+      setIsProcessing(true);
+      setProcessingStatus('Loading PDF...');
+      const buffer = await file.arrayBuffer();
+      const data = new Uint8Array(buffer);
+      resetForNewFile();
+
+      try {
+        const doc = await openPdfDocument(data, '');
+        await finalizeLoad(doc, data, '');
+      } catch (err: any) {
+        if (err?.name === 'PasswordException') {
+          // Encrypted PDF — stash the bytes and ask the user to unlock it.
+          pendingDataRef.current = data;
+          setPasswordValue('');
+          setPasswordError('');
+          setPasswordPrompt(true);
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      console.error('Upload error:', err);
+      showNotice('Could not open this PDF: ' + (err as Error).message, 'error');
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  const submitPassword = async () => {
+    const data = pendingDataRef.current;
+    if (!data) return;
+    try {
+      setIsProcessing(true);
+      setProcessingStatus('Unlocking PDF...');
+      const doc = await openPdfDocument(data, passwordValue);
+      await finalizeLoad(doc, data, passwordValue);
+      setPasswordPrompt(false);
+      setPasswordValue('');
+      setPasswordError('');
+      pendingDataRef.current = null;
+    } catch (err: any) {
+      if (err?.name === 'PasswordException') {
+        // code 2 = INCORRECT_PASSWORD, code 1 = NEED_PASSWORD
+        setPasswordError(err.code === 2 ? 'Incorrect password. Please try again.' : 'A password is required to open this PDF.');
+      } else {
+        setPasswordError('Could not open PDF: ' + (err as Error).message);
+      }
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  const cancelPassword = () => {
+    setPasswordPrompt(false);
+    setPasswordValue('');
+    setPasswordError('');
+    pendingDataRef.current = null;
+  };
+
+  // ---- Shared overlays (used on both the landing screen and the editor) ----
+  const processingOverlay = isProcessing && (
+    <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1500 }}>
+      <div style={{ backgroundColor: 'var(--color-canvas)', padding: '28px 40px', borderRadius: '12px', textAlign: 'center' }}>
+        <div style={{ width: '36px', height: '36px', border: '4px solid var(--color-hairline)', borderTop: '4px solid var(--color-link)', borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 12px' }} />
+        <div style={{ fontWeight: 500, color: 'var(--color-ink)' }}>{processingStatus}</div>
+      </div>
+    </div>
+  );
+
+  const noticeOverlay = notice && (
+    <div style={{ position: 'fixed', top: '20px', left: '50%', transform: 'translateX(-50%)', zIndex: 2500, maxWidth: '92vw', animation: 'noticeIn 0.25s ease-out' }}>
+      <div style={{
+        display: 'flex', alignItems: 'flex-start', gap: '12px',
+        backgroundColor: 'var(--color-canvas)', borderRadius: '12px',
+        padding: '14px 16px', minWidth: '280px', maxWidth: '480px',
+        boxShadow: '0px 1px 1px rgba(0,0,0,0.04), 0px 8px 16px -4px rgba(0,0,0,0.12), 0px 24px 32px -8px rgba(0,0,0,0.10)',
+        borderLeft: `4px solid ${notice.type === 'error' ? 'var(--color-error)' : notice.type === 'success' ? 'var(--color-cyan-deep)' : 'var(--color-link)'}`
+      }}>
+        <div style={{
+          flexShrink: 0, width: '24px', height: '24px', borderRadius: '50%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#fff',
+          backgroundColor: notice.type === 'error' ? 'var(--color-error)' : notice.type === 'success' ? 'var(--color-cyan-deep)' : 'var(--color-link)'
+        }}>
+          {notice.type === 'error' ? '!' : notice.type === 'success' ? '✓' : 'i'}
+        </div>
+        <div style={{ flex: 1, fontSize: '14px', lineHeight: '20px', color: 'var(--color-ink)' }}>
+          {notice.message}
+        </div>
+        <button onClick={() => setNotice(null)} style={{ flexShrink: 0, border: 'none', background: 'none', cursor: 'pointer', fontSize: '16px', color: 'var(--color-mute)', lineHeight: 1, padding: '2px' }}>✕</button>
+      </div>
+    </div>
+  );
+
+  const passwordModal = passwordPrompt && (
+    <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3000, padding: '16px' }}>
+      <form
+        onSubmit={(e) => { e.preventDefault(); submitPassword(); }}
+        style={{ backgroundColor: 'var(--color-canvas)', borderRadius: '12px', padding: '24px', width: '100%', maxWidth: '360px', boxShadow: '0px 24px 32px -8px rgba(0,0,0,0.24)' }}
+      >
+        <div style={{ fontSize: '18px', fontWeight: 600, color: 'var(--color-ink)', marginBottom: '6px' }}>🔒 Password required</div>
+        <div style={{ fontSize: '14px', color: 'var(--color-body)', marginBottom: '16px', lineHeight: '20px' }}>
+          This PDF is password protected. Enter its password to open and edit it.
+        </div>
+        <input
+          type="password"
+          autoFocus
+          value={passwordValue}
+          onChange={(e) => setPasswordValue(e.target.value)}
+          placeholder="Password"
+          style={{ width: '100%', boxSizing: 'border-box', height: '40px', padding: '0 12px', borderRadius: '8px', border: '1px solid var(--color-hairline)', fontSize: '15px', marginBottom: passwordError ? '8px' : '16px' }}
+        />
+        {passwordError && (
+          <div style={{ fontSize: '13px', color: 'var(--color-error)', marginBottom: '16px' }}>{passwordError}</div>
+        )}
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button type="button" onClick={cancelPassword} style={{ height: '38px', padding: '0 16px', borderRadius: '100px', border: '1px solid var(--color-hairline)', backgroundColor: 'var(--color-canvas)', color: 'var(--color-ink)', fontSize: '14px', fontWeight: 500, cursor: 'pointer' }}>Cancel</button>
+          <button type="submit" disabled={!passwordValue} style={{ height: '38px', padding: '0 20px', borderRadius: '100px', border: 'none', backgroundColor: 'var(--color-link)', color: '#fff', fontSize: '14px', fontWeight: 600, cursor: passwordValue ? 'pointer' : 'not-allowed', opacity: passwordValue ? 1 : 0.5 }}>Unlock</button>
+        </div>
+      </form>
+    </div>
+  );
+
+  const sharedKeyframes = (
+    <style>{`@keyframes spin { 0% { transform: rotate(0deg);} 100% { transform: rotate(360deg);} } @keyframes noticeIn { from { opacity: 0; transform: translate(-50%, -12px);} to { opacity: 1; transform: translate(-50%, 0);} }`}</style>
+  );
+
   // ---- Landing ----
   if (!pdfData) {
     return (
       <div style={{ maxWidth: '900px', margin: '0 auto', padding: 'clamp(16px,5vw,48px)', minHeight: '70vh', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+        {processingOverlay}
+        {noticeOverlay}
+        {passwordModal}
+        {sharedKeyframes}
         <h1 style={{ fontSize: 'clamp(32px,8vw,48px)', fontWeight: 600, letterSpacing: '-2.4px', marginBottom: '12px', color: 'var(--color-ink)' }}>PDF Editor.</h1>
         <p style={{ fontSize: 'clamp(14px,4vw,18px)', color: 'var(--color-body)', marginBottom: '32px' }}>
           Edit existing text, add text, shapes, highlights, images, signatures. Manage pages, then download.
         </p>
         <div style={{ border: '2px dashed var(--color-hairline)', borderRadius: '12px', padding: 'clamp(24px,8vw,48px)', textAlign: 'center', backgroundColor: 'var(--color-canvas)' }}>
-          <input ref={inputRef} type="file" accept=".pdf" onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])} style={{ display: 'none' }} />
+          <input ref={inputRef} type="file" accept="application/pdf,.pdf" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.target.value = ''; }} style={{ display: 'none' }} />
           <div style={{ fontSize: 'clamp(24px,6vw,32px)', fontWeight: 600, marginBottom: '12px', color: 'var(--color-ink)' }}>Upload PDF</div>
           <button onClick={() => inputRef.current?.click()} style={{ backgroundColor: 'var(--color-primary)', color: 'var(--color-on-primary)', fontSize: '16px', fontWeight: 500, padding: '12px 24px', borderRadius: '100px', border: 'none', cursor: 'pointer' }}>Choose File</button>
         </div>
@@ -631,42 +1135,13 @@ export default function PDFEditor() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      <input ref={imageInputRef} type="file" accept="image/*" onChange={(e) => e.target.files?.[0] && handleImageSelected(e.target.files[0])} style={{ display: 'none' }} />
-      <input ref={inputRef} type="file" accept=".pdf" onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])} style={{ display: 'none' }} />
+      <input ref={imageInputRef} type="file" accept="image/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleImageSelected(f); e.target.value = ''; }} style={{ display: 'none' }} />
+      <input ref={inputRef} type="file" accept="application/pdf,.pdf" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.target.value = ''; }} style={{ display: 'none' }} />
 
-      {isProcessing && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1500 }}>
-          <div style={{ backgroundColor: 'var(--color-canvas)', padding: '28px 40px', borderRadius: '12px', textAlign: 'center' }}>
-            <div style={{ width: '36px', height: '36px', border: '4px solid var(--color-hairline)', borderTop: '4px solid var(--color-link)', borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 12px' }} />
-            <div style={{ fontWeight: 500, color: 'var(--color-ink)' }}>{processingStatus}</div>
-          </div>
-        </div>
-      )}
+      {processingOverlay}
       {showSignaturePad && <SignaturePad onSave={handleSignatureSave} onClose={() => setShowSignaturePad(false)} />}
-
-      {notice && (
-        <div style={{ position: 'fixed', top: '20px', left: '50%', transform: 'translateX(-50%)', zIndex: 2500, maxWidth: '92vw', animation: 'noticeIn 0.25s ease-out' }}>
-          <div style={{
-            display: 'flex', alignItems: 'flex-start', gap: '12px',
-            backgroundColor: 'var(--color-canvas)', borderRadius: '12px',
-            padding: '14px 16px', minWidth: '280px', maxWidth: '480px',
-            boxShadow: '0px 1px 1px rgba(0,0,0,0.04), 0px 8px 16px -4px rgba(0,0,0,0.12), 0px 24px 32px -8px rgba(0,0,0,0.10)',
-            borderLeft: `4px solid ${notice.type === 'error' ? 'var(--color-error)' : notice.type === 'success' ? 'var(--color-cyan-deep)' : 'var(--color-link)'}`
-          }}>
-            <div style={{
-              flexShrink: 0, width: '24px', height: '24px', borderRadius: '50%',
-              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#fff',
-              backgroundColor: notice.type === 'error' ? 'var(--color-error)' : notice.type === 'success' ? 'var(--color-cyan-deep)' : 'var(--color-link)'
-            }}>
-              {notice.type === 'error' ? '!' : notice.type === 'success' ? '✓' : 'i'}
-            </div>
-            <div style={{ flex: 1, fontSize: '14px', lineHeight: '20px', color: 'var(--color-ink)' }}>
-              {notice.message}
-            </div>
-            <button onClick={() => setNotice(null)} style={{ flexShrink: 0, border: 'none', background: 'none', cursor: 'pointer', fontSize: '16px', color: 'var(--color-mute)', lineHeight: 1, padding: '2px' }}>✕</button>
-          </div>
-        </div>
-      )}
+      {passwordModal}
+      {noticeOverlay}
 
       {/* ROW 1: Tools */}
       <div style={barStyle()}>
@@ -691,12 +1166,14 @@ export default function PDFEditor() {
         <span style={lbl()}>Highlight</span>
         <input type="color" value={fillColor} onChange={(e) => setFillColor(e.target.value)} style={colorInput()} />
         <div style={divider()} />
-        <select value={fontFamily} onChange={(e) => { setFontFamily(e.target.value); applyStyleToSelection({ fontFamily: e.target.value }); }} style={selStyle()}>
+        <select value={fontFamily} onChange={(e) => applyFontFamily(e.target.value)} style={selStyle()}>
           {FONTS.map(f => <option key={f} value={f}>{f}</option>)}
         </select>
         <span style={lbl()}>Size</span>
         <input type="number" min={6} max={120} value={fontSize} onChange={(e) => { setFontSize(+e.target.value); applyStyleToSelection({ fontSize: +e.target.value }); }} style={{ ...selStyle(), width: '52px' }} />
-        <button onClick={() => toggleStyle('fontWeight', 'bold', 'normal')} style={{ ...btnStyle(), fontWeight: 700, width: '30px', padding: 0 }}>B</button>
+        <span style={lbl()}>Weight {fontWeight}</span>
+        <input type="range" min={100} max={900} step={100} value={fontWeight} onChange={(e) => applyFontWeight(+e.target.value)} style={{ width: '90px' }} title="Font weight / boldness" />
+        <button onClick={() => applyFontWeight(fontWeight >= 600 ? 400 : 700)} style={{ ...btnStyle(), fontWeight: 700, width: '30px', padding: 0 }}>B</button>
         <button onClick={() => toggleStyle('fontStyle', 'italic', 'normal')} style={{ ...btnStyle(), fontStyle: 'italic', width: '30px', padding: 0 }}>I</button>
         <button onClick={() => toggleStyle('underline', true, false)} style={{ ...btnStyle(), textDecoration: 'underline', width: '30px', padding: 0 }}>U</button>
         <button onClick={() => applyStyleToSelection({ textAlign: 'left' })} style={{ ...btnStyle(), width: '30px', padding: 0 }}>⯇</button>
@@ -734,18 +1211,17 @@ export default function PDFEditor() {
         <button onClick={() => zoomBy(0.1)} style={btnStyle()}>+</button>
         <button onClick={fitToWidth} style={btnStyle()}>Fit W</button>
         <button onClick={fitToPage} style={btnStyle()}>Fit P</button>
-        <button onClick={handleSave} style={{ ...btnStyle(), marginLeft: 'auto', backgroundColor: 'var(--color-link)', color: '#fff', border: 'none', borderRadius: '100px', padding: '0 22px', fontWeight: 600 }}>⬇ Download PDF</button>
       </div>
 
       {/* CANVAS AREA - centered, large */}
-      <div ref={canvasAreaRef} style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', overflow: 'auto', padding: '14px', backgroundColor: 'var(--color-canvas-soft-2)' }}>
-        <div style={{ position: 'relative', boxShadow: '0 4px 16px rgba(0,0,0,0.18)', borderRadius: '2px', margin: 'auto' }}>
+      <div ref={canvasAreaRef} style={{ flex: 1, overflow: 'auto', padding: '14px', backgroundColor: 'var(--color-canvas-soft-2)', textAlign: 'center', WebkitOverflowScrolling: 'touch' as any, touchAction: 'pan-x pan-y' }}>
+        <div style={{ position: 'relative', display: 'inline-block', boxShadow: '0 4px 16px rgba(0,0,0,0.18)', borderRadius: '2px', textAlign: 'left' }}>
           <canvas ref={pdfCanvasRef} style={{ display: 'block', borderRadius: '2px' }} />
           <canvas ref={fabricCanvasElRef} style={{ position: 'absolute', top: 0, left: 0 }} />
         </div>
       </div>
 
-      <style>{`@keyframes spin { 0% { transform: rotate(0deg);} 100% { transform: rotate(360deg);} } @keyframes noticeIn { from { opacity: 0; transform: translate(-50%, -12px);} to { opacity: 1; transform: translate(-50%, 0);} }`}</style>
+      {sharedKeyframes}
     </div>
   );
 }
