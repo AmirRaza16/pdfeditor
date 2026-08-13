@@ -3,11 +3,12 @@
 
 <nav class="nav-bar">
   <div class="logo" aria-label="PDF Editor">
+  <a href="/">
     <img class="logo-img logo-light" src="/logo-black.svg" alt="PDF Editor" />
     <img class="logo-img logo-dark" src="/logo-white.svg" alt="PDF Editor" />
     <span class="visually-hidden" style="margin-left: 8px;">PDF Editor</span>
+    </a>
   </div>
-
   <div class="nav-actions">
     <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">
       <!-- Shown in light mode (click to go dark) -->
@@ -54,6 +55,7 @@
   }
   .logo-img { height: 32px; width: auto; display: block; }
   .logo-dark { display: none; }
+  .logo a { display: flex; align-items: center; text-decoration: none; color: inherit;font-weight: 600; font-size: 16px; }
   :global([data-theme='dark']) .logo-light { display: none; }
   :global([data-theme='dark']) .logo-dark { display: block; }
 

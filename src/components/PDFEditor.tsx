@@ -3,6 +3,7 @@ import { PDFDocument, degrees, rgb, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
 import * as fabric from 'fabric';
 import SignaturePad from './SignaturePad';
+import { recompressPageImages, compressPDF } from '../lib/pdfImageCompress';
 import { ALL_FONTS, isWebFont, nearestWeight, getWebFontBytes, ensureWebFontFace, fallbackStandardFamily } from './fonts';
 
 type Tool = 'select' | 'text' | 'edittext' | 'rect' | 'ellipse' | 'line' | 'arrow' | 'highlight' | 'draw' | 'whiteout' | 'image' | 'signature';
@@ -26,7 +27,7 @@ const FABRIC_BASELINE_RATIO = FABRIC_FONT_SIZE_MULT * (1 - FABRIC_FONT_SIZE_FRAC
 const FABRIC_LINE_ADVANCE = FABRIC_LINE_HEIGHT * FABRIC_FONT_SIZE_MULT;                 // ≈ 1.3108
 const TEXT_IMPORT_SIZE_RATIO = 0.92;      // overlay font size vs raw glyph-box height
 // Custom fabric properties that must survive toObject/loadFromJSON round-trips.
-const EXTRA_PROPS = ['_isOriginal', '_origText', '_origColor', '_maskColor', '_maskW', '_maskH', '_origLeft', '_origTop', '_fontKey', '_fallbackFamily', '_origFamily', '_origWeight', '_origItalic', '_whiteout', '_edited'];
+const EXTRA_PROPS = ['_isOriginal', '_origText', '_origColor', '_maskColor', '_maskW', '_maskH', '_origLeft', '_origTop', '_fontKey', '_fallbackFamily', '_origFamily', '_origWeight', '_origItalic', '_origFontSize', '_origFontHeight', '_whiteout', '_edited'];
 
 export default function PDFEditor() {
   const [pdfData, setPdfData] = useState<Uint8Array | null>(null);
@@ -40,6 +41,15 @@ export default function PDFEditor() {
   const [hasSelection, setHasSelection] = useState(false);
   const [notice, setNotice] = useState<{ message: string; type: 'info' | 'error' | 'success' } | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // PDF compression feature
+  const [showCompressDialog, setShowCompressDialog] = useState(false);
+  const [compressionQuality, setCompressionQuality] = useState(0.70);
+  const [compressionScale, setCompressionScale] = useState(0.85);
+  const [isCompressing, setIsCompressing] = useState(false);
+  const [compressProgress, setCompressProgress] = useState('');
+  const [compressedSize, setCompressedSize] = useState(0);
+  const [originalSize, setOriginalSize] = useState(0);
 
   // Password-protected PDF handling
   const [passwordPrompt, setPasswordPrompt] = useState(false);
@@ -237,13 +247,12 @@ export default function PDFEditor() {
 
         // Init / resize fabric canvas
         if (!fabricRef.current) {
-          // enableRetinaScaling:false keeps the Fabric overlay at the same 1x pixel
-          // scale as the (non-retina) PDF canvas above. On high-DPI phones the retina
-          // pipeline made Fabric's pointer mapping and overlay scale diverge from the
-          // page, so taps registered offset (up/left) and saved text drifted from what
-          // the preview showed. Matching the scales fixes both; on 1x desktops (where
-          // it already worked) this is a no-op.
-          fabricRef.current = new fabric.Canvas(fabricCanvasElRef.current!, { width: dispW, height: dispH, allowTouchScrolling: true, enableRetinaScaling: false });
+          // Enable retina scaling (default behavior) so Fabric.js automatically
+          // compensates for device pixel ratio, matching the PDF.js canvas coordinate
+          // system. This ensures text overlays align correctly on all devices and zoom
+          // levels, preventing the production alignment bug where text shifts up/right
+          // on activation and down/left after saving on high-DPI displays.
+          fabricRef.current = new fabric.Canvas(fabricCanvasElRef.current!, { width: dispW, height: dispH, allowTouchScrolling: true });
           fabricRef.current.allowTouchScrolling = true;
           const wrapper = fabricRef.current.wrapperEl;
           if (wrapper) { wrapper.style.position = 'absolute'; wrapper.style.top = '0'; wrapper.style.left = '0'; }
@@ -416,7 +425,20 @@ export default function PDFEditor() {
     canvas.on('selection:created', (e: any) => { (e.selected || []).forEach(reveal); syncToolbar(e.selected || []); canvas.requestRenderAll(); setHasSelection(true); });
     canvas.on('selection:updated', (e: any) => { (e.deselected || []).forEach(hideIfPristine); (e.selected || []).forEach(reveal); syncToolbar(e.selected || []); canvas.requestRenderAll(); setHasSelection(true); });
     canvas.on('selection:cleared', () => { hideAllPristine(); setHasSelection(false); });
-    canvas.on('text:editing:entered', (e: any) => { reveal(e.target); canvas.requestRenderAll(); });
+    canvas.on('text:editing:entered', (e: any) => {
+      reveal(e.target);
+      // Fix: Bake scale into fontSize when entering edit mode to preserve visual size
+      const textObj = e.target as any;
+      if (textObj && typeof textObj.fontSize === 'number' && textObj.scaleY && textObj.scaleY !== 1) {
+        const actualSize = textObj.fontSize * textObj.scaleY;
+        textObj.set({
+          fontSize: actualSize,
+          scaleY: 1,
+          scaleX: 1
+        });
+      }
+      canvas.requestRenderAll();
+    });
     canvas.on('text:changed', (e: any) => { if (e.target?._isOriginal) e.target._edited = true; });
     canvas.on('text:editing:exited', () => { hideAllPristine(); saveHistory(); });
   };
@@ -526,12 +548,37 @@ export default function PDFEditor() {
         let fontObj: any = null;
         try { if (item.fontName && page.commonObjs.has(item.fontName)) fontObj = page.commonObjs.get(item.fontName); } catch { /* not resolved yet */ }
         const styleInfo = fontStyles[item.fontName] || {};
-        const fontDesc = `${fontObj?.name || ''} ${fontObj?.loadedName || ''} ${styleInfo.fontFamily || ''} ${item.fontName || ''}`.toLowerCase();
-        const isBold = !!fontObj?.bold || /bold|black|heavy|semibold|extrabold|w[6-9]00/.test(fontDesc);
+        
+        // Enhanced font detection: extract family name from font object
+        const fontName = fontObj?.name || styleInfo.fontFamily || item.fontName || '';
+        const loadedName = fontObj?.loadedName || '';
+        const fontDesc = `${fontName} ${loadedName}`.toLowerCase();
+        
+        // Detect weight with more precision
+        let weight = 400;
+        if (fontObj?.black || /black/.test(fontDesc)) weight = 900;
+        else if (fontObj?.bold || /bold/.test(fontDesc)) weight = 700;
+        else if (/semibold|demibold/.test(fontDesc)) weight = 600;
+        else if (/medium/.test(fontDesc)) weight = 500;
+        else if (/light/.test(fontDesc)) weight = 300;
+        else if (/thin|hairline/.test(fontDesc)) weight = 100;
+        else if (/w([1-9]00)/.test(fontDesc)) {
+          const match = fontDesc.match(/w([1-9]00)/);
+          if (match) weight = parseInt(match[1]);
+        }
+        
+        const isBold = weight >= 600;
         const isItalic = !!fontObj?.italic || /italic|oblique/.test(fontDesc);
+        
+        // Detect font family with better heuristics
         let family = 'Helvetica';
-        if (/times|georgia|roman|serif|garamond|minion|book antiqua/.test(fontDesc)) family = 'Times New Roman';
-        else if (/courier|mono|consol/.test(fontDesc)) family = 'Courier';
+        if (/times|georgia|roman|serif|garamond|minion|book antiqua|cambria|palatino/.test(fontDesc)) {
+          family = 'Times New Roman';
+        } else if (/courier|mono|consol|fixed/.test(fontDesc)) {
+          family = 'Courier';
+        } else if (/arial/.test(fontDesc)) {
+          family = 'Helvetica'; // Arial is similar to Helvetica
+        }
 
         // Stash the original embedded font program so edits keep the typeface.
         let fontKey = '';
@@ -551,33 +598,55 @@ export default function PDFEditor() {
         const boxW = Math.max(20, (item.width || item.str.length * fontHeight * 0.5) + 4);
         const { bg, fg } = sampleRegion(tx[4], glyphTop, item.width || boxW, fontHeight * 1.2);
 
-        // Imported text is invisible by default (fill + background transparent),
-        // so the page keeps its exact original appearance until edited.
-        const tb = new fabric.Textbox(item.str, {
-          left: tx[4], top, fontSize: overlayFontSize,
-          fill: 'transparent', fontFamily: displayFamily,
-          fontWeight: isBold ? 700 : 400,
-          fontStyle: isItalic ? 'italic' : 'normal',
-          backgroundColor: 'transparent',
-          editable: true, width: boxW
+        // Split text into words for individual word selection
+        // This allows users to select and edit individual words instead of entire lines
+        const text = item.str;
+        const words = text.split(/(\s+)/); // Split by whitespace but keep the spaces
+        let currentX = tx[4];
+        const charWidth = (item.width || 0) / text.length || fontHeight * 0.5;
+        
+        words.forEach((word: string) => {
+          if (!word) return;
+          
+          const wordWidth = word.length * charWidth;
+          const wordBoxW = Math.max(20, wordWidth + 4);
+          
+          // Imported text is invisible by default (fill + background transparent),
+          // so the page keeps its exact original appearance until edited.
+          const tb = new fabric.Textbox(word, {
+            left: currentX, top, fontSize: overlayFontSize,
+            fill: 'transparent', fontFamily: displayFamily,
+            fontWeight: weight,
+            fontStyle: isItalic ? 'italic' : 'normal',
+            backgroundColor: 'transparent',
+            editable: true, width: wordBoxW,
+            scaleX: 1,
+            scaleY: 1
+          });
+          Object.assign(tb as any, {
+            _isOriginal: true,
+            _fallbackFamily: family,
+            _origText: word,
+            _origColor: fg,
+            _maskColor: bg,
+            _maskW: wordWidth || wordBoxW,
+            _maskH: fontHeight * 1.3,
+            _origLeft: currentX,
+            _origTop: glyphTop,
+            _fontKey: fontKey,
+            _origFamily: displayFamily,
+            _origWeight: weight,
+            _origItalic: isItalic,
+            _origFontSize: overlayFontSize,
+            _origFontHeight: fontHeight,
+            _edited: false,
+          });
+          canvas.add(tb);
+          added++;
+          
+          // Move to next word position
+          currentX += wordWidth;
         });
-        Object.assign(tb as any, {
-          _isOriginal: true,
-          _fallbackFamily: family,
-          _origText: item.str,
-          _origColor: fg,
-          _maskColor: bg,
-          _maskW: item.width || boxW,
-          _maskH: fontHeight * 1.3,
-          _origLeft: tx[4],
-          _origTop: glyphTop,
-          _fontKey: fontKey,
-          _origFamily: displayFamily,
-          _origWeight: isBold ? 700 : 400,
-          _origItalic: isItalic,
-          _edited: false,
-        });
-        canvas.add(tb); added++;
       });
       canvas.renderAll();
       setIsProcessing(false); setProcessingStatus('');
@@ -1164,7 +1233,609 @@ export default function PDFEditor() {
     pendingDataRef.current = null;
   };
 
+  const handleNewPDF = () => {
+    if (pdfData && !confirm('Start working on a new PDF? Any unsaved changes will be lost.')) {
+      return;
+    }
+    // Reset all state
+    setPdfData(null);
+    setPageList([]);
+    setCurrentIndex(0);
+    annotationsRef.current = {};
+    rotationsRef.current = {};
+    blankSizesRef.current = {};
+    historyRef.current = {};
+    historyIndexRef.current = {};
+    pdfjsDocRef.current = null;
+    passwordRef.current = '';
+    fontDataRef.current = {};
+    fabricRef.current?.dispose();
+    fabricRef.current = null;
+    idCounter.current = 0;
+    setActiveTool('select');
+    setHasSelection(false);
+    editTextLoadedRef.current = false;
+  };
+
+  // Compression presets
+  const compressionPresets = [
+    { name: 'Low Compression', quality: 0.92, scale: 1.0, description: 'Minimal compression, best quality' },
+    { name: 'Medium', quality: 0.70, scale: 0.85, description: 'Balanced (recommended)' },
+    { name: 'High', quality: 0.50, scale: 0.70, description: 'Aggressive, good size reduction' },
+    { name: 'Maximum', quality: 0.35, scale: 0.60, description: 'Very aggressive, smallest files' },
+  ];
+
+  const applyCompressionPreset = (preset: typeof compressionPresets[0]) => {
+    setCompressionQuality(preset.quality);
+    setCompressionScale(preset.scale);
+  };
+
+  const handleCompressPDF = async () => {
+    if (!pdfjsDocRef.current || !pdfData) return;
+    
+    try {
+      setIsCompressing(true);
+      setCompressProgress('Preparing compression...');
+      setOriginalSize(pdfData.length);
+      
+      saveCurrentAnnotations();
+      
+      // Check if there are any edits/annotations
+      const hasAnyEdits = Object.values(annotationsRef.current).some(ann => {
+        if (!ann) return false;
+        try {
+          const parsed = typeof ann === 'string' ? JSON.parse(ann) : ann;
+          return parsed?.objects && parsed.objects.length > 0;
+        } catch {
+          return false;
+        }
+      });
+      
+      let docToCompress: PDFDocument;
+      
+      // Respect user's compression choice:
+      // - Quality >= 0.30: Preserve vector text with aggressive image compression
+      // - Quality < 0.30: Rasterize for extreme compression (user wants absolute smallest file)
+      const shouldRasterize = compressionQuality < 0.30;
+      
+      if (!hasAnyEdits && shouldRasterize) {
+        // User wants maximum compression - rasterize pages
+        setCompressProgress('Applying maximum compression (rasterizing pages)...');
+        const tempDoc = await PDFDocument.create();
+        
+        try {
+          const srcDoc = await PDFDocument.load(pdfData, { ignoreEncryption: true });
+          const numPages = srcDoc.getPageCount();
+          
+          // Use user's selected scale and quality
+          const renderScale = compressionScale;
+          const renderQuality = compressionQuality;
+          
+          for (let i = 0; i < numPages; i++) {
+            if (i % 10 === 0 || numPages < 10) {
+              setCompressProgress(`Rasterizing page ${i + 1} of ${numPages}...`);
+            }
+            
+            const page = await pdfjsDocRef.current!.getPage(i + 1);
+            const vp1 = page.getViewport({ scale: 1 });
+            const vp = page.getViewport({ scale: renderScale });
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = vp.width;
+            canvas.height = vp.height;
+            const ctx = canvas.getContext('2d')!;
+            
+            await page.render({ canvasContext: ctx, viewport: vp }).promise;
+            
+            const dataUrl = canvas.toDataURL('image/jpeg', renderQuality);
+            const jpegBytes = await (await fetch(dataUrl)).arrayBuffer();
+            
+            const newPage = tempDoc.addPage([vp1.width, vp1.height]);
+            const img = await tempDoc.embedJpg(new Uint8Array(jpegBytes));
+            newPage.drawImage(img, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+          }
+          
+          docToCompress = tempDoc;
+          console.log('[compress] Pages rasterized at user\'s requested quality:', renderQuality, 'scale:', renderScale);
+        } catch (err) {
+          console.error('Failed to rasterize pages:', err);
+          docToCompress = await PDFDocument.load(pdfData, { ignoreEncryption: true });
+        }
+      } else if (!hasAnyEdits) {
+        // No edits - directly compress the original PDF
+        setCompressProgress('Loading original PDF for compression...');
+        try {
+          docToCompress = await PDFDocument.load(pdfData, { ignoreEncryption: true });
+        } catch (err) {
+          console.error('Failed to load original PDF:', err);
+          showNotice('Error loading PDF for compression', 'error');
+          setIsCompressing(false);
+          return;
+        }
+      } else {
+        // Has edits - build a temporary PDF with all edits as vector
+        setCompressProgress('Building PDF with edits...');
+        let srcDoc: PDFDocument | null = null;
+        try { srcDoc = await PDFDocument.load(pdfData, { ignoreEncryption: true }); } catch { srcDoc = null; }
+        
+        // Adjust raster quality based on compression level
+        const RASTER_SCALE = compressionScale >= 0.9 ? 2 : compressionScale >= 0.7 ? 1.5 : 1;
+        const RASTER_QUALITY = compressionQuality;
+        
+        const rasterizePage = async (srcIndex: number) => {
+          const page = await pdfjsDocRef.current!.getPage(srcIndex + 1);
+          const vp1 = page.getViewport({ scale: 1 });
+          const vp = page.getViewport({ scale: RASTER_SCALE });
+          const c = document.createElement('canvas');
+          c.width = vp.width; c.height = vp.height;
+          await page.render({ canvasContext: c.getContext('2d')!, viewport: vp }).promise;
+          // Use JPEG instead of PNG for much smaller file size
+          const dataUrl = c.toDataURL('image/jpeg', RASTER_QUALITY);
+          const bytes = await (await fetch(dataUrl)).arrayBuffer();
+          return { bytes, w: vp1.width, h: vp1.height };
+        };
+        
+        const tempDoc = await PDFDocument.create();
+        try { tempDoc.registerFontkit(fontkit); } catch { /* already registered */ }
+        
+        const fontCache = new Map<string, any>();
+        const getFont = async (std: string) => {
+          if (!fontCache.has(std)) fontCache.set(std, await tempDoc.embedFont(std as any));
+          return fontCache.get(std);
+        };
+        const origFontCache = new Map<string, any>();
+        const getOrigFont = async (fontKey: string) => {
+          if (!fontKey) return null;
+          if (origFontCache.has(fontKey)) return origFontCache.get(fontKey);
+          let f: any = null;
+          const entry = fontDataRef.current[fontKey];
+          if (entry?.bytes) {
+            try {
+              f = await tempDoc.embedFont(entry.bytes, { subset: true });
+              try { f.__charset = new Set<number>(f.getCharacterSet()); } catch { f.__charset = null; }
+            } catch { f = null; }
+          }
+          origFontCache.set(fontKey, f);
+          return f;
+        };
+        const fontCovers = (pdfFont: any, text: string): boolean => {
+          try {
+            const set: Set<number> | null = pdfFont?.__charset || null;
+            if (!set) { pdfFont.widthOfTextAtSize(text || ' ', 12); return true; }
+            for (const ch of text) {
+              const cp = ch.codePointAt(0)!;
+              if (cp === 10 || cp === 13) continue;
+              if (!set.has(cp)) return false;
+            }
+            return true;
+          } catch { return false; }
+        };
+        const webFontCache = new Map<string, any>();
+        const resolveSelectedFont = async (family: string, weight: number, italic: boolean) => {
+          if (isWebFont(family)) {
+            const w = nearestWeight(family, weight);
+            const key = `${family}-${w}-${italic ? 'i' : 'n'}`;
+            if (webFontCache.has(key)) {
+              const cached = webFontCache.get(key);
+              if (cached) return cached;
+            } else {
+              try {
+                const bytes = await getWebFontBytes(family, weight, italic);
+                if (bytes) {
+                  const f = await tempDoc.embedFont(bytes.slice(0), { subset: true });
+                  try { f.__charset = new Set<number>(f.getCharacterSet()); } catch { f.__charset = null; }
+                  webFontCache.set(key, f);
+                  return f;
+                }
+              } catch { /* fall through to standard */ }
+              webFontCache.set(key, null);
+            }
+            family = fallbackStandardFamily(family);
+          }
+          return await getFont(pickFont(family, weight >= 600, italic));
+        };
+        
+        // Build temp PDF with vector text
+        for (const entry of pageList) {
+          const key = entry.id;
+          const rot = rotationsRef.current[key] || 0;
+          let pageRef; let baseW: number, baseH: number;
+
+          if (entry.src != null) {
+            let copiedOk = false;
+            if (srcDoc) {
+              try {
+                const [copied] = await tempDoc.copyPages(srcDoc, [entry.src]);
+                pageRef = tempDoc.addPage(copied);
+                const sz = pageRef.getSize(); baseW = sz.width; baseH = sz.height;
+                copiedOk = true;
+            } catch { copiedOk = false; }
+          }
+          if (!copiedOk) {
+            const { bytes, w, h } = await rasterizePage(entry.src);
+            baseW = w; baseH = h;
+            pageRef = tempDoc.addPage([baseW, baseH]);
+            const img = await tempDoc.embedJpg(bytes);
+            pageRef.drawImage(img, { x: 0, y: 0, width: baseW, height: baseH });
+          }
+        } else {
+          const size = blankSizesRef.current[key] || defaultSizeRef.current;
+          pageRef = tempDoc.addPage([size.w, size.h]); baseW = size.w; baseH = size.h;
+        }
+        if (rot) pageRef.setRotation(degrees(rot));
+
+        const ann = annotationsRef.current[key];
+        if (!ann) continue;
+
+        const el = document.createElement('canvas');
+        el.width = baseW; el.height = baseH;
+        const tmp = new fabric.StaticCanvas(el, { width: baseW, height: baseH, enableRetinaScaling: false });
+        await tmp.loadFromJSON(ann);
+        const allObjects = tmp.getObjects();
+        const isTextObj = (o: any) => o instanceof fabric.Text || o instanceof fabric.IText || o instanceof fabric.Textbox;
+        const isWhiteoutObj = (o: any) => o._whiteout === true;
+
+        const drawTextObject = async (t: any) => {
+          const isOrig = t._isOriginal === true;
+          const changed = isOrig
+            ? (t._edited === true || String(t.text ?? '') !== String(t._origText ?? ''))
+            : true;
+          if (isOrig && !changed) return;
+
+          const size = (t.fontSize || 16) * (t.scaleY || 1);
+          const left = t.left || 0;
+          const top = t.top || 0;
+          const boxW = (t.width || 0) * (t.scaleX || 1);
+          const weightNum = Number(t.fontWeight) || (t.fontWeight === 'bold' ? 700 : 400);
+          const bold = weightNum >= 600;
+          const italic = t.fontStyle === 'italic';
+          const lines = String(t.text ?? '').split('\n');
+          
+          let font: any = null;
+          if (isOrig && t._fontKey) {
+            const sameFamily = !t._origFamily || t.fontFamily === t._origFamily;
+            const sameWeight = !t._origWeight || weightNum === t._origWeight;
+            const sameItalic = (italic === !!t._origItalic);
+            if (sameFamily && sameWeight && sameItalic) {
+              const of = await getOrigFont(t._fontKey);
+              if (of && fontCovers(of, String(t.text ?? ''))) font = of;
+            }
+          }
+          if (!font) {
+            font = await resolveSelectedFont(t.fontFamily, weightNum, italic);
+            if (font && font.__charset && !fontCovers(font, String(t.text ?? ''))) {
+              font = await getFont(pickFont(t._fallbackFamily || fallbackStandardFamily(t.fontFamily), bold, italic));
+            }
+          }
+          
+          const fillStr = (t.fill && t.fill !== 'transparent') ? t.fill : (t._origColor || '#171717');
+          const textColor = parseColor(fillStr);
+          const lineHeight = size * FABRIC_LINE_ADVANCE;
+          const firstBaseline = size * FABRIC_BASELINE_RATIO;
+
+          if (isOrig) {
+            const mw = Math.max(t._maskW || 0, boxW || 0, 10);
+            const contentH = Math.max(t._maskH || size * 1.3, lines.length * lineHeight);
+            const padTop = size * 0.2;
+            const mLeft = (t._origLeft != null) ? t._origLeft : left;
+            const mTop = (t._origTop != null) ? t._origTop : top;
+            try { pageRef.drawRectangle({ x: mLeft, y: baseH - mTop - contentH, width: mw, height: contentH + padTop, color: parseColor(t._maskColor || '#ffffff') }); } catch {}
+          } else if (t.backgroundColor && t.backgroundColor !== 'transparent') {
+            const bh = lines.length * lineHeight;
+            try { pageRef.drawRectangle({ x: left, y: baseH - top - bh, width: boxW || 10, height: bh, color: parseColor(t.backgroundColor) }); } catch {}
+          }
+
+          lines.forEach((line, i) => {
+            if (!line) return;
+            let x = left;
+            try {
+              const tw = font.widthOfTextAtSize(line, size);
+              if (t.textAlign === 'center') x = left + (boxW - tw) / 2;
+              else if (t.textAlign === 'right') x = left + (boxW - tw);
+            } catch {}
+            const yBaseline = baseH - top - firstBaseline - i * lineHeight;
+            try {
+              pageRef.drawText(line, { x, y: yBaseline, size, font, color: textColor });
+            } catch {
+              try {
+                const safe = line.replace(/[^\x00-\xFF]/g, '');
+                if (safe) pageRef.drawText(safe, { x, y: yBaseline, size, font, color: textColor });
+              } catch {}
+            }
+          });
+        };
+
+        const drawWhiteout = (o: any) => {
+          const left = o.left || 0, top = o.top || 0;
+          const w = (o.width || 0) * (o.scaleX || 1), h = (o.height || 0) * (o.scaleY || 1);
+          if (w <= 0 || h <= 0) return;
+          const color = parseColor(o._maskColor || (typeof o.fill === 'string' ? o.fill : '#ffffff'));
+          try { pageRef.drawRectangle({ x: left, y: baseH - top - h, width: w, height: h, color }); } catch {}
+        };
+
+        allObjects.forEach((o: any) => { o.visible = false; });
+        let batch: any[] = [];
+        const flushBatch = async () => {
+          if (!batch.length) return;
+          batch.forEach(o => { o.visible = true; });
+          tmp.renderAll();
+          // Use JPEG with quality for smaller file size, and adjust multiplier based on compression
+          const multiplier = compressionScale >= 0.9 ? 1.5 : compressionScale >= 0.7 ? 1.2 : 1;
+          const url = tmp.toDataURL({ format: 'jpeg', quality: RASTER_QUALITY, multiplier });
+          const jpegBytes = await (await fetch(url)).arrayBuffer();
+          const jpeg = await tempDoc.embedJpg(jpegBytes);
+          pageRef.drawImage(jpeg, { x: 0, y: 0, width: baseW, height: baseH });
+          batch.forEach(o => { o.visible = false; });
+          batch = [];
+        };
+        for (const o of allObjects as any[]) {
+          if (isTextObj(o)) { await flushBatch(); await drawTextObject(o); }
+          else if (isWhiteoutObj(o)) { await flushBatch(); drawWhiteout(o); }
+          else { batch.push(o); }
+        }
+        await flushBatch();
+        tmp.dispose();
+      }
+      
+      docToCompress = tempDoc;
+    }
+
+      // Use comprehensive PDF compression
+      const stats = await compressPDF(docToCompress, compressionQuality, compressionScale, setCompressProgress);
+      const totalFound = stats.imagesFound;
+      const totalReplaced = stats.imagesReplaced;
+      const totalSkipped = stats.imagesSkipped;
+      const totalBytesSaved = stats.bytesSaved;
+      const skipReasons = stats.skipReasons;
+      console.log('[compress] images found=', totalFound, 'replaced=', totalReplaced, 'skipped=', totalSkipped, 'skipReasons=', skipReasons, 'bytesSaved=', totalBytesSaved);
+
+      setCompressProgress('Finalizing compressed PDF...');
+      const bytes = await docToCompress.save();
+      
+      // CRITICAL: Never output a file larger than the original
+      if (bytes.length > pdfData.length) {
+        console.warn('[compress] Compressed file is larger than original! Using original instead.');
+        showNotice(
+          `PDF compression skipped - compressed file would be larger than original (${formatBytes(pdfData.length)}).`,
+          'info'
+        );
+        setIsCompressing(false);
+        setShowCompressDialog(false);
+        return;
+      }
+      
+      setCompressedSize(bytes.length);
+      
+      const blob = new Blob([bytes], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'compressed.pdf';
+      link.click();
+      URL.revokeObjectURL(url);
+      
+      const reductionPct = ((pdfData.length - bytes.length) / pdfData.length * 100).toFixed(1);
+      const skipSummary = Object.entries(skipReasons)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([k, v]) => `${k}:${v}`)
+        .join(', ');
+      showNotice(
+        `PDF compressed! Reduced by ${reductionPct}% (${formatBytes(pdfData.length)} → ${formatBytes(bytes.length)}). ` +
+        `Images: ${totalReplaced} recompressed, ${totalSkipped} skipped (${skipSummary}).`,
+        'success'
+      );
+      
+      setIsCompressing(false);
+      setShowCompressDialog(false);
+    } catch (err) {
+      console.error('Compression error:', err);
+      showNotice('Error compressing PDF: ' + (err as Error).message, 'error');
+      setIsCompressing(false);
+    }
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
   // ---- Shared overlays (used on both the landing screen and the editor) ----
+  const compressionDialog = showCompressDialog && (
+    <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3000, padding: '16px', overflowY: 'auto' }}>
+      <div style={{ backgroundColor: 'var(--color-canvas)', borderRadius: '12px', padding: 'clamp(16px, 4vw, 24px)', width: '100%', maxWidth: '520px', boxShadow: '0px 24px 32px -8px rgba(0,0,0,0.24)', margin: 'auto' }}>
+        <div style={{ fontSize: 'clamp(16px, 4vw, 18px)', fontWeight: 600, color: 'var(--color-ink)', marginBottom: '8px' }}>
+          Compress PDF
+        </div>
+        <div style={{ fontSize: 'clamp(12px, 3vw, 13px)', color: 'var(--color-mute)', marginBottom: '20px', lineHeight: '1.5' }}>
+          Optimize file size by compressing images and removing unnecessary data.
+        </div>
+        
+        {/* Compression mode indicator */}
+        {compressionQuality < 0.30 ? (
+          <div style={{ 
+            display: 'flex', 
+            alignItems: 'flex-start', 
+            gap: '10px',
+            padding: '12px 14px', 
+            backgroundColor: '#fef3c7', 
+            borderLeft: '3px solid #f59e0b',
+            borderRadius: '4px', 
+            marginBottom: '20px',
+            fontSize: '12px',
+            lineHeight: '1.6',
+            color: '#92400e'
+          }}>
+            <span style={{ fontSize: '16px', flexShrink: 0 }}>⚠️</span>
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: '4px' }}>Extreme Compression Mode</div>
+              <div style={{ opacity: 0.9 }}>
+                Pages will be rasterized as images for maximum compression. Text will not be selectable or searchable.
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ 
+            display: 'flex', 
+            alignItems: 'flex-start', 
+            gap: '10px',
+            padding: '12px 14px', 
+            backgroundColor: '#d1fae5', 
+            borderLeft: '3px solid #10b981',
+            borderRadius: '4px', 
+            marginBottom: '20px',
+            fontSize: '12px',
+            lineHeight: '1.6',
+            color: '#065f46'
+          }}>
+            <span style={{ fontSize: '16px', flexShrink: 0 }}>✓</span>
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: '4px' }}>Vector Compression Mode</div>
+              <div style={{ opacity: 0.9 }}>
+                Text and graphics preserved as vectors. Images compressed aggressively. Content remains selectable and searchable.
+              </div>
+            </div>
+          </div>
+        )}
+        
+        {/* Compression presets */}
+        <div style={{ marginBottom: '20px' }}>
+          <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-ink)', marginBottom: '10px' }}>Presets:</div>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            {compressionPresets.map(preset => {
+              const isSelected = compressionQuality === preset.quality && compressionScale === preset.scale;
+              return (
+                <button
+                  key={preset.name}
+                  onClick={() => applyCompressionPreset(preset)}
+                  style={{
+                    flex: '1 1 calc(33% - 6px)',
+                    minWidth: '100px',
+                    padding: '12px',
+                    borderRadius: '8px',
+                    border: isSelected
+                      ? '2px solid var(--color-link)'
+                      : '1px solid var(--color-hairline)',
+                    backgroundColor: isSelected
+                      ? 'var(--color-link-bg-soft)'
+                      : 'var(--color-canvas)',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    touchAction: 'manipulation',
+                    minHeight: '52px'
+                  }}
+                >
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-ink)', marginBottom: '4px' }}>
+                    {preset.name}
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-mute)', lineHeight: '1.3' }}>{preset.description}</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Manual controls */}
+        <div style={{ marginBottom: '20px', padding: '12px', backgroundColor: 'var(--color-canvas-soft)', borderRadius: '8px' }}>
+          <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--color-mute)', marginBottom: '12px' }}>
+            Advanced Settings:
+          </div>
+          <div style={{ marginBottom: '16px' }}>
+            <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', fontWeight: 500, color: 'var(--color-ink)', marginBottom: '8px' }}>
+              <span>Quality</span>
+              <span>{Math.round(compressionQuality * 100)}%</span>
+            </label>
+            <input
+              type="range"
+              min="0.1"
+              max="1"
+              step="0.05"
+              value={compressionQuality}
+              onChange={(e) => setCompressionQuality(parseFloat(e.target.value))}
+              style={{ width: '100%', height: '32px', cursor: 'pointer' }}
+            />
+            <div style={{ fontSize: '11px', color: 'var(--color-mute)', marginTop: '4px' }}>
+              Lower = smaller file, higher = better image quality
+            </div>
+          </div>
+          <div>
+            <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', fontWeight: 500, color: 'var(--color-ink)', marginBottom: '8px' }}>
+              <span>Scale</span>
+              <span>{compressionScale.toFixed(2)}x</span>
+            </label>
+            <input
+              type="range"
+              min="0.5"
+              max="2"
+              step="0.25"
+              value={compressionScale}
+              onChange={(e) => setCompressionScale(parseFloat(e.target.value))}
+              style={{ width: '100%', height: '32px', cursor: 'pointer' }}
+            />
+            <div style={{ fontSize: '11px', color: 'var(--color-mute)', marginTop: '4px' }}>
+              Lower = smaller file, higher = better resolution
+            </div>
+          </div>
+        </div>
+
+        {isCompressing && (
+          <div style={{ padding: '12px', backgroundColor: 'var(--color-canvas-soft)', borderRadius: '8px', marginBottom: '16px', textAlign: 'center' }}>
+            <div style={{ fontSize: '13px', color: 'var(--color-body)' }}>{compressProgress}</div>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={() => setShowCompressDialog(false)}
+            disabled={isCompressing}
+            style={{
+              minHeight: '44px',
+              height: '44px',
+              padding: '0 20px',
+              borderRadius: '100px',
+              border: '1px solid var(--color-hairline)',
+              backgroundColor: 'var(--color-canvas)',
+              color: 'var(--color-ink)',
+              fontSize: '14px',
+              fontWeight: 500,
+              cursor: isCompressing ? 'not-allowed' : 'pointer',
+              opacity: isCompressing ? 0.5 : 1,
+              touchAction: 'manipulation',
+              flex: '1 1 auto',
+              minWidth: '100px'
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleCompressPDF}
+            disabled={isCompressing}
+            style={{
+              minHeight: '44px',
+              height: '44px',
+              padding: '0 20px',
+              borderRadius: '100px',
+              border: 'none',
+              backgroundColor: 'var(--color-link)',
+              color: '#fff',
+              fontSize: '14px',
+              fontWeight: 600,
+              cursor: isCompressing ? 'not-allowed' : 'pointer',
+              opacity: isCompressing ? 0.5 : 1,
+              touchAction: 'manipulation',
+              flex: '1 1 auto',
+              minWidth: '140px'
+            }}
+          >
+            {isCompressing ? 'Processing...' : 'Compress & Download'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
   const processingOverlay = isProcessing && (
     <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1500 }}>
       <div style={{ backgroundColor: 'var(--color-canvas)', padding: '28px 40px', borderRadius: '12px', textAlign: 'center' }}>
@@ -1235,6 +1906,7 @@ export default function PDFEditor() {
   if (!pdfData) {
     return (
       <div style={{ maxWidth: '900px', margin: '0 auto', padding: 'clamp(16px,5vw,48px)', minHeight: '70vh', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+        {compressionDialog}
         {processingOverlay}
         {noticeOverlay}
         {passwordModal}
@@ -1272,6 +1944,7 @@ export default function PDFEditor() {
       <input ref={imageInputRef} type="file" accept="image/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleImageSelected(f); e.target.value = ''; }} style={{ display: 'none' }} />
       <input ref={inputRef} type="file" accept="application/pdf,.pdf" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.target.value = ''; }} style={{ display: 'none' }} />
 
+      {compressionDialog}
       {processingOverlay}
       {showSignaturePad && <SignaturePad onSave={handleSignatureSave} onClose={() => setShowSignaturePad(false)} />}
       {passwordModal}
@@ -1281,12 +1954,15 @@ export default function PDFEditor() {
       <div style={barStyle()}>
         {tools.map(t => (
           <button key={t.id} onClick={() => setActiveTool(t.id)} title={t.label} style={{
-            display: 'flex', alignItems: 'center', gap: '5px', height: '30px', padding: '0 9px', borderRadius: '5px', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: '6px', minHeight: '38px', height: '38px', 
+            padding: '0 12px', borderRadius: '6px', cursor: 'pointer',
             border: activeTool === t.id ? '2px solid var(--color-link)' : '1px solid var(--color-hairline)',
             backgroundColor: activeTool === t.id ? 'var(--color-link-bg-soft)' : 'var(--color-canvas)',
-            color: 'var(--color-ink)', fontSize: '12px', fontWeight: 500, whiteSpace: 'nowrap'
+            color: 'var(--color-ink)', fontSize: '13px', fontWeight: 500, whiteSpace: 'nowrap',
+            flexShrink: 0, touchAction: 'manipulation'
           }}>
-            <span style={{ fontSize: '14px' }}>{t.icon}</span>{t.label}
+            <span style={{ fontSize: '16px' }}>{t.icon}</span>
+            <span style={{ display: window.innerWidth < 768 ? 'none' : 'inline' }}>{t.label}</span>
           </button>
         ))}
       </div>
@@ -1323,7 +1999,12 @@ export default function PDFEditor() {
 
       {/* ROW 3: Actions */}
       <div style={barStyle()}>
+        {/* <button onClick={handleNewPDF} style={{...btnStyle(), backgroundColor: 'var(--color-canvas)', fontWeight: 600}} title="Start working on a new PDF">
+          ⬅ Back
+        </button> */}
+        <div style={divider()} />
         <button onClick={() => inputRef.current?.click()} style={btnStyle()}><img className="invert-on-dark" src="/replace-file.png" alt="" width={14} height={14} style={{ verticalAlign: 'middle', marginRight: '5px' }} /> Replace</button>
+        <button onClick={() => setShowCompressDialog(true)} style={btnStyle()}>🗜 Compress</button>
         <div style={divider()} />
         <button onClick={handleUndo} disabled={!canUndo} style={btnStyle(!canUndo)}>↶</button>
         <button onClick={handleRedo} disabled={!canRedo} style={btnStyle(!canRedo)}>↷</button>
@@ -1362,21 +2043,23 @@ export default function PDFEditor() {
 
 function barStyle(): React.CSSProperties {
   return {
-    display: 'flex', gap: '4px', alignItems: 'center', flexWrap: 'nowrap', overflowX: 'auto',
-    padding: '4px 8px', backgroundColor: 'var(--color-canvas)', borderBottom: '1px solid var(--color-hairline)'
+    display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'nowrap', overflowX: 'auto',
+    padding: '6px 8px', backgroundColor: 'var(--color-canvas)', borderBottom: '1px solid var(--color-hairline)',
+    WebkitOverflowScrolling: 'touch', scrollbarWidth: 'thin'
   };
 }
 function btnStyle(disabled = false): React.CSSProperties {
   return {
-    backgroundColor: 'var(--color-canvas)', color: 'var(--color-ink)', fontSize: '12px', fontWeight: 500,
-    padding: '0 8px', height: '30px', borderRadius: '5px', border: '1px solid var(--color-hairline)',
-    cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.4 : 1, whiteSpace: 'nowrap', flexShrink: 0
+    backgroundColor: 'var(--color-canvas)', color: 'var(--color-ink)', fontSize: '13px', fontWeight: 500,
+    padding: '0 10px', minHeight: '36px', height: '36px', borderRadius: '6px', border: '1px solid var(--color-hairline)',
+    cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.4 : 1, whiteSpace: 'nowrap', flexShrink: 0,
+    touchAction: 'manipulation'
   };
 }
-function divider(): React.CSSProperties { return { width: '1px', height: '20px', backgroundColor: 'var(--color-hairline)', flexShrink: 0 }; }
-function lbl(): React.CSSProperties { return { fontSize: '11px', color: 'var(--color-mute)', whiteSpace: 'nowrap', flexShrink: 0 }; }
-function colorInput(): React.CSSProperties { return { width: '28px', height: '28px', border: '1px solid var(--color-hairline)', borderRadius: '5px', background: 'none', cursor: 'pointer', flexShrink: 0, padding: 0 }; }
-function selStyle(): React.CSSProperties { return { height: '28px', padding: '0 6px', borderRadius: '5px', border: '1px solid var(--color-hairline)', fontSize: '12px', flexShrink: 0 }; }
+function divider(): React.CSSProperties { return { width: '1px', height: '24px', backgroundColor: 'var(--color-hairline)', flexShrink: 0 }; }
+function lbl(): React.CSSProperties { return { fontSize: '12px', color: 'var(--color-mute)', whiteSpace: 'nowrap', flexShrink: 0 }; }
+function colorInput(): React.CSSProperties { return { width: '32px', height: '32px', border: '1px solid var(--color-hairline)', borderRadius: '6px', background: 'none', cursor: 'pointer', flexShrink: 0, padding: 0 }; }
+function selStyle(): React.CSSProperties { return { minHeight: '32px', height: '32px', padding: '0 8px', borderRadius: '6px', border: '1px solid var(--color-hairline)', fontSize: '13px', flexShrink: 0 }; }
 
 function pickFont(family: string | undefined, bold: boolean, italic: boolean): string {
   const f = (family || '').toLowerCase();
